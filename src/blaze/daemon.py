@@ -30,7 +30,8 @@ log = logging.getLogger("blaze")
 
 YES = re.compile(r"\b(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|confirm|please do)\b", re.I)
 NO = re.compile(r"\b(no|nope|don't|do not|stop|cancel|never mind|wait)\b", re.I)
-ECHO_DELAY = 1.0  # seconds of speech to hear before deciding whether to stop talking
+ECHO_DELAY = 0.6  # seconds of your speech to hear before deciding whether to stop talking
+END_OF_TURN = 0.6  # extra quiet after you finish (on top of the mic's own pause) before he answers
 
 
 def is_echo(heard: str, said: str) -> bool:
@@ -44,6 +45,7 @@ def is_echo(heard: str, said: str) -> bool:
 
 GOODBYE = re.compile(r"\b(bye|goodbye|see you|that's all|that is all|go to sleep|stop listening)\b", re.I)
 GLANCE_PROMPT = "In one short sentence, what is the person in front of the camera doing?"
+WANTS_LOOK = re.compile(r"\b(see|look|watch|check|show|showing|holding|doing|wearing|what)\b", re.I)
 
 
 def human_duration(seconds: float) -> str:
@@ -72,20 +74,27 @@ class Blaze:
         self.state = "starting"
         self.muted = not self.settings.listening.enabled
         self.awake_until = 0.0  # follow-up window: listen without the wake word until then
+        self.camera_on = False  # closed until you ask him to open it
         self.last_glance: tuple[float, str] | None = None
         self.last_break_reminder = 0.0
         self.recent: collections.deque[dict] = collections.deque(maxlen=50)  # chat shown in the app
         self._said = ""  # what Blaze is saying / said last, to recognize his own echo
         self._echo_until = 0.0  # mic input before this time may contain his voice
-        self._waiting: list[str] = []  # things you said that haven't been answered yet
-        self._answering = False
+        # Turn-taking: what you've said but he hasn't answered, and the answer in progress.
+        self._pending: list[str] = []
+        self._waiter: asyncio.Task | None = None
+        self._answer_task: asyncio.Task | None = None
+        self._answer_text = ""
+        self._transcribing = False
+        self._last_speech_end = 0.0
 
         self.voice = Voice(self.settings.voice)
         self.stt: Transcriber | None = None
+        self.quick_stt: Transcriber | None = None
         self.ears: Ears | None = None
         self.eyes: Eyes | None = None
-        self.hands = Hands(self.settings.hands, self.memory, self.confirm,
-                           self.look_at_camera, self.look_at_screen, self.remind)
+        self.hands = Hands(self.settings.hands, self.memory, self.confirm, self.look_at_camera,
+                           self.look_at_screen, self.remind, self.open_camera, self.close_camera)
         self.brain = Brain(self.settings, self.hands, self.memory)
 
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -137,6 +146,8 @@ class Blaze:
         ls = self.settings.listening
         try:
             self.stt = await asyncio.to_thread(Transcriber, ls.stt_model, ls.language)
+            # A tiny, fast model just for "is that really you talking over me?"
+            self.quick_stt = await asyncio.to_thread(Transcriber, "tiny.en", "en")
         except Exception:
             log.exception("Could not load speech recognition")
             self.stt = None
@@ -145,7 +156,7 @@ class Blaze:
         if self.eyes:
             self.eyes.stop()
             self.eyes = None
-        if not self.settings.camera.enabled:
+        if not (self.camera_on and self.settings.camera.enabled):
             return
         if not (FACE_DETECTOR.exists() and FACE_RECOGNIZER.exists()):
             log.error("Face models missing — run `blaze setup`")
@@ -160,6 +171,7 @@ class Blaze:
         self.brain.settings = new
         self.hands.settings = new.hands
         self.muted = not new.listening.enabled
+        self.camera_on = self.camera_on and new.camera.enabled
 
         if new.brain.ollama_host != old.brain.ollama_host:
             self.brain = Brain(new, self.hands, self.memory)
@@ -202,6 +214,8 @@ class Blaze:
             "muted": self.muted,
             "model": self.settings.brain.model,
             "voice": self.settings.voice.engine,
+            "camera_on": self.camera_on,
+            "camera_allowed": self.settings.camera.enabled,
             "eyes": self.eyes.status() if self.eyes else None,
             "mic_level": self.ears.level if self.ears else 0.0,
             "messages": self.memory.message_count(),
@@ -226,6 +240,8 @@ class Blaze:
                 parts.append(f"{who} is at the desk (for {human_duration(since)}).")
             else:
                 parts.append("Nobody is at the desk right now.")
+        else:
+            parts.append("Your camera is closed, so you can't see the desk.")
         if self.last_glance and time.time() - self.last_glance[0] < 30 * 60:
             ago = human_duration(time.time() - self.last_glance[0])
             parts.append(f"When you glanced at the camera {ago} ago you saw: {self.last_glance[1]}")
@@ -256,15 +272,20 @@ class Blaze:
                 self.ears.muted = False
             self.set_state(self._resting_state())
 
-    async def converse(self, text: str, speak: bool = True) -> str:
+    async def converse(self, text: str, speak: bool = True, post: bool = True) -> str:
         async with self._turn_lock:
             self.awake_until = float("inf")  # stay in the conversation while thinking and talking
-            self._post("user", text)
+            if post:
+                self._post("user", text)
             self.set_state("thinking")
             try:
                 reply = await self.brain.respond(text, self.context())
             except BrainUnavailable as e:
                 reply = str(e)
+            except asyncio.CancelledError:  # you kept talking; the answer will be redone with everything
+                self.awake_until = time.monotonic() + self.settings.listening.follow_up_seconds
+                self.set_state(self._resting_state())
+                raise
             except Exception:
                 log.exception("Thinking failed")
                 reply = "Sorry, something went wrong in my head. Check my logs."
@@ -277,21 +298,32 @@ class Blaze:
         self.spawn(self.brain.learn(text))  # quietly remember anything lasting about you
         return reply
 
-    def _queue_speech(self, text: str) -> None:
-        """Collect what you say; anything said while he's busy is answered together as one turn."""
-        self._waiting.append(text)
-        if not self._answering:
-            self.spawn(self._answer_waiting())
+    def _hear(self, text: str) -> None:
+        """You said something to him: answer once you've finished talking."""
+        self.awake_until = float("inf")  # you're talking to him now, so the rest of your sentence counts too
+        self._post("user", text)
+        self._pending.append(text)
+        if self._waiter is None or self._waiter.done():
+            self._waiter = self.spawn(self._answer_when_done())
 
-    async def _answer_waiting(self) -> None:
-        self._answering = True
-        try:
-            while self._waiting:
-                text = " ".join(self._waiting)
-                self._waiting.clear()
-                await self.converse(text)
-        finally:
-            self._answering = False
+    def _you_are_talking(self) -> bool:
+        return bool(self.ears and self.ears.in_speech) or self._transcribing
+
+    async def _answer_when_done(self) -> None:
+        """Wait until you've really finished (not just paused), then answer it all as one message."""
+        while True:
+            await asyncio.sleep(0.1)
+            if self._you_are_talking() or time.monotonic() - self._last_speech_end < END_OF_TURN:
+                continue
+            if self._answer_task and not self._answer_task.done():
+                await asyncio.wait({self._answer_task})  # let the current answer finish, then re-check
+                continue
+            break
+        if not self._pending:
+            return
+        self._answer_text = " ".join(self._pending)
+        self._pending.clear()
+        self._answer_task = self.spawn(self.converse(self._answer_text, post=False))
 
     async def proactive(self, instruction: str) -> None:
         """Say something on Blaze's own initiative — but never interrupt a conversation."""
@@ -308,20 +340,41 @@ class Blaze:
             self.awake_until = time.monotonic() + self.settings.listening.follow_up_seconds
 
     def _user_started_talking(self) -> None:
-        """Called by the ears the moment speech begins while the mic is open."""
-        if self.voice.speaking and self.settings.listening.interruptible:
-            self.spawn(self._maybe_interrupt())
+        """The ears heard sound begin while he's busy: check whether it's you, then make room."""
+        busy = self.voice.speaking or (self._answer_task and not self._answer_task.done())
+        if busy and self.settings.listening.interruptible:
+            self.spawn(self._make_room_if_real())
 
-    async def _maybe_interrupt(self) -> None:
-        """Stop talking if you're really talking over him — not his own voice leaking into the mic."""
+    async def _make_room_if_real(self) -> None:
+        """If that was really you talking (not noise, typing or his own echo), stop and listen."""
         await asyncio.sleep(ECHO_DELAY)
         audio = self.ears.current_audio() if self.ears else None
-        if audio is None or not self.voice.speaking or self.stt is None:
+        stt = self.quick_stt or self.stt
+        if audio is None or stt is None:
             return
-        heard = await asyncio.to_thread(self.stt.transcribe, audio, self.settings.persona.name)
-        if not is_echo(heard, self._said) and self.voice.speaking:
+        heard = await asyncio.to_thread(stt.transcribe, audio)
+        if is_echo(heard, self._said):
+            return
+        task = self._answer_task
+        if self.voice.speaking:
             log.info("Interrupted by: %s", heard)
             self.voice.stop()
+        elif task and not task.done() and self.state == "thinking" and not self.brain.acted:
+            # You weren't finished: drop the half-made answer and redo it with everything you say.
+            log.info("You're still talking (%s) — holding my answer", heard)
+            task.cancel()
+            self._pending.insert(0, self._answer_text)
+            if self._waiter is None or self._waiter.done():
+                self._waiter = self.spawn(self._answer_when_done())
+
+    async def _transcribe(self, audio, in_conversation: bool) -> str:
+        """Speech to text. The name hint is only used to rescue a misheard "Blaze" in real speech,
+        because on its own it makes Whisper "hear" the name in background noise."""
+        text = await asyncio.to_thread(self.stt.transcribe, audio)
+        if not text or in_conversation or self._strip_wake_word(text) is not None:
+            return text
+        hinted = await asyncio.to_thread(self.stt.transcribe, audio, self.settings.persona.name)
+        return hinted if self._strip_wake_word(hinted) is not None else text
 
     async def wake(self) -> None:
         self.awake_until = time.monotonic() + max(self.settings.listening.follow_up_seconds, 6)
@@ -343,9 +396,16 @@ class Blaze:
         self.ears = Ears(ls.input_device, ls.vad_aggressiveness)
         self.ears.on_speech_start = self._user_started_talking
         async for utterance in self.ears.utterances():
+            self._last_speech_end = time.monotonic()
             if self.muted or self.stt is None:
                 continue
-            text = await asyncio.to_thread(self.stt.transcribe, utterance.audio, self.settings.persona.name)
+            in_conversation = utterance.started < self.awake_until
+            self._transcribing = True
+            try:
+                text = await self._transcribe(utterance.audio, in_conversation)
+            finally:
+                self._transcribing = False
+                self._last_speech_end = time.monotonic()
             if not text:
                 continue
             if utterance.started < self._echo_until and is_echo(text, self._said):
@@ -363,7 +423,6 @@ class Blaze:
             # "Hey Blaze" starts a conversation; after that he answers everything until
             # you go quiet for a while or say bye. Judge by when you *started* talking,
             # so a long sentence that began in time still counts.
-            in_conversation = utterance.started < self.awake_until
             command = self._strip_wake_word(text)
             if command is None:
                 if not in_conversation:
@@ -376,7 +435,7 @@ class Blaze:
             if len(command.strip(" .,!?")) < 2:  # just "Hey Blaze"
                 self.spawn(self.wake())
                 continue
-            self._queue_speech(command)
+            self._hear(command)
 
     # confirmation ---------------------------------------------------------------
 
@@ -396,9 +455,51 @@ class Blaze:
 
     # seeing ----------------------------------------------------------------------
 
+    async def set_camera(self, on: bool) -> str:
+        """Open or close the webcam. It stays closed until you ask for it."""
+        if on and not self.settings.camera.enabled:
+            return "The camera is turned off in Settings, so I can't open it."
+        if on != self.camera_on:
+            self.camera_on = on
+            await asyncio.to_thread(self._start_eyes)
+            if not on:
+                self.last_glance = None
+            log.info("Camera %s", "opened" if on else "closed")
+            self.publish_status()
+        if on and not await self._wait_for_picture():
+            return "I opened the camera but I'm not getting a picture from it."
+        return "The camera is open." if on else "The camera is closed."
+
+    async def _wait_for_picture(self, timeout: float = 6.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.eyes and self.eyes.camera_ok and self.eyes.snapshot_jpeg():
+                return True
+            await asyncio.sleep(0.2)
+        return False
+
+    async def open_camera(self) -> str:
+        result = await self.set_camera(True)
+        # "Open the camera and see what I'm doing": look right away instead of just opening it.
+        if result == "The camera is open." and WANTS_LOOK.search(self.brain.last_user_text or ""):
+            try:
+                return f"The camera is open. {await self.look_at_camera('')}"
+            except BrainUnavailable as e:
+                return f"The camera is open, but looking through it failed: {e}"
+        return result
+
+    async def close_camera(self) -> str:
+        return await self.set_camera(False)
+
     async def look_at_camera(self, question: str) -> str:
+        if not self.camera_on:
+            # Asking him to look is asking him to open it.
+            result = await self.set_camera(True)
+            if result != "The camera is open.":
+                return result
+            await asyncio.sleep(1.0)  # let the webcam settle its exposure
         if not (self.eyes and self.eyes.camera_ok):
-            return "The camera is off or not working."
+            return "The camera isn't working."
         image = self.eyes.snapshot_jpeg()
         if not image:
             return "I couldn't get a picture."
@@ -522,9 +623,11 @@ class Blaze:
                 self.memory.add_fact(args["text"])
             case "remove_fact":
                 self.memory.remove_fact(int(args["id"]))
+            case "camera":
+                return await self.set_camera(bool(args.get("on", not self.camera_on)))
             case "learn_face":
                 if not self.eyes:
-                    raise RuntimeError("The camera is off.")
+                    raise RuntimeError("Open the camera first.")
                 return await asyncio.to_thread(self.eyes.enroll)
             case "forget_face":
                 if self.eyes:

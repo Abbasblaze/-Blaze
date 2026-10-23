@@ -121,6 +121,8 @@ class Hands:
         look_camera: Callable[[str], Awaitable[str]],
         look_screen: Callable[[str], Awaitable[str]],
         remind: Callable[[float, str], None],
+        open_camera: Callable[[], Awaitable[str]],
+        close_camera: Callable[[], Awaitable[str]],
     ):
         self.settings = settings
         self.memory = memory
@@ -128,6 +130,8 @@ class Hands:
         self._look_camera = look_camera
         self._look_screen = look_screen
         self._remind = remind
+        self._open_camera = open_camera
+        self._close_camera = close_camera
         self.tools = {t.name: t for t in self._define()}
 
     def schemas(self) -> list[dict]:
@@ -176,6 +180,8 @@ class Hands:
                  {"percent": "1-100"}, types={"percent": "integer"}),
             Tool("media", "Control music/video playback.", self.media,
                  {"action": "play, pause, toggle, next, previous, or status"}),
+            Tool("open_camera", "Turn the webcam on. It stays off until the user asks.", self._open_camera),
+            Tool("close_camera", "Turn the webcam off.", self._close_camera),
             Tool("look_at_camera", "Look through the webcam to see the user or what they're holding or showing.",
                  self._look_camera, {"question": "the user's question, in their own words"}),
             Tool("look_at_screen", "Look at what's on the laptop screen right now.",

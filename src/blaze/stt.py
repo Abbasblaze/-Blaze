@@ -42,6 +42,9 @@ class Transcriber:
         )
         parts = [s.text for s in segments if s.no_speech_prob < 0.6 and s.avg_logprob > -1.0]
         text = " ".join(p.strip() for p in parts).strip()
+        # Whisper sometimes repeats a sentence: "I'll fix it. I'll fix it. I'll fix it."
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        text = " ".join(x for i, x in enumerate(sentences) if i == 0 or x.lower() != sentences[i - 1].lower())
         if text.lower().strip(" .!?,") in HALLUCINATIONS:
             return ""
         words = re.findall(r"[a-z']+", text.lower())

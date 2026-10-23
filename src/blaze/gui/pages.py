@@ -39,7 +39,7 @@ def button(text: str, kind: str = "", slot=None) -> QPushButton:
 
 def presence_text(eyes: dict | None, user: str) -> str:
     if not eyes:
-        return "Camera off"
+        return "Camera closed"
     if not eyes.get("camera_ok"):
         return "Camera not available"
     if not eyes.get("present"):
@@ -173,8 +173,8 @@ class CameraPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 24, 28, 20)
         layout.addWidget(page_header(
-            "Camera", "What Blaze sees. Frames stay on this laptop and are never saved — "
-                      "only what you see here, live."))
+            "Camera", "What Blaze sees. The camera stays closed until you open it here or say "
+                      "\u201copen the camera\u201d. Frames stay on this laptop and are never saved."))
 
         self.preview = QLabel("No picture", alignment=Qt.AlignmentFlag.AlignCenter)
         self.preview.setMinimumHeight(300)
@@ -185,7 +185,10 @@ class CameraPage(QWidget):
         layout.addWidget(self.info)
 
         row = QHBoxLayout()
-        self.learn_btn = button("Learn my face", "primary", self._learn)
+        self.camera_on = False
+        self.camera_btn = button("Open camera", "primary", self._toggle_camera)
+        row.addWidget(self.camera_btn)
+        self.learn_btn = button("Learn my face", "", self._learn)
         row.addWidget(self.learn_btn)
         row.addWidget(button("Forget my face", "danger", self._forget))
         row.addStretch()
@@ -206,11 +209,24 @@ class CameraPage(QWidget):
         super().hideEvent(event)
 
     def _refresh(self) -> None:
-        self.client.request("snapshot", self._show)
+        if self.camera_on:
+            self.client.request("snapshot", self._show)
+
+    def _toggle_camera(self) -> None:
+        self.camera_btn.setEnabled(False)
+
+        def done(ok: bool, data) -> None:
+            self.camera_btn.setEnabled(True)
+            if ok and data not in ("The camera is open.", "The camera is closed."):
+                QMessageBox.warning(self, "Blaze", str(data))
+
+        self.client.request("camera", done, on=not self.camera_on)
 
     def _show(self, ok: bool, data) -> None:
+        if not self.camera_on:
+            return
         if not ok or not data:
-            self.preview.setText("No picture — camera off or not available")
+            self.preview.setText("Opening the camera…")
             return
         image = QImage.fromData(base64.b64decode(data), "JPG")
         pix = QPixmap.fromImage(image).scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
@@ -218,9 +234,24 @@ class CameraPage(QWidget):
         self.preview.setPixmap(pix)
 
     def on_status(self, msg: dict) -> None:
-        eyes = msg.get("eyes")
-        if not eyes:
+        on = bool(msg.get("camera_on"))
+        if on != self.camera_on:
+            self.camera_on = on
+            self.camera_btn.setText("Close camera" if on else "Open camera")
+            self.camera_btn.setObjectName("danger" if on else "primary")
+            self.camera_btn.style().polish(self.camera_btn)
+            if not on:
+                self.preview.clear()
+                self.preview.setText("Camera closed")
+        self.learn_btn.setEnabled(on)
+        if not msg.get("camera_allowed", True):
             self.info.setText("The camera is turned off in Settings.")
+            self.camera_btn.setEnabled(False)
+            return
+        self.camera_btn.setEnabled(True)
+        eyes = msg.get("eyes")
+        if not on or not eyes:
+            self.info.setText("Camera closed. Blaze can't see anything until you open it.")
             return
         knows = "knows your face" if eyes["knows_owner"] else "hasn't learned your face yet"
         who = {"owner": "you", "someone": "someone"}.get(eyes["who"] or "", "nobody")

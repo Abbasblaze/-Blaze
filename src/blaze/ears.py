@@ -132,6 +132,11 @@ class Ears:
                     voiced, speaking, self._current = [], False, None
 
 
+    @property
+    def in_speech(self) -> bool:
+        """True while someone is in the middle of saying something."""
+        return self._current is not None
+
     def current_audio(self) -> np.ndarray | None:
         """What's been said so far in the utterance still in progress, if any."""
         frames = self._current

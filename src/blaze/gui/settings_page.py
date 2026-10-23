@@ -169,7 +169,7 @@ class SettingsPage(QWidget):
 
     def _build_camera(self) -> None:
         f = self._group("Camera")
-        self.cam_enabled = QCheckBox("Use the camera")
+        self.cam_enabled = QCheckBox("Let Blaze open the camera when I ask")
         self.cam_device = QComboBox()
         self.glance = spin(0, 120, 1, 1, " min")
         self.away_after = spin(10, 3600, 10, 0, " s")

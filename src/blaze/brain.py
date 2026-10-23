@@ -29,9 +29,11 @@ How you talk:
 - Be honest. Only say you did something if the tool result says it worked. If a tool fails or finds nothing, say so plainly and mention what you did find.
 
 When to use tools:
+- {user} asks you to open or turn on the camera: call open_camera. To close or turn it off: call close_camera.
 - {user} asks what you see, how they look, or what they're holding or showing: call look_at_camera, passing their question in their own words.
 - {user} asks about their screen or what's open: call look_at_screen.
 - {user} shares something lasting about themselves: call remember.
+- {user} asks you to forget something: call forget with a key word from it (for example "pet store").
 - Finding or opening files and apps, windows, volume, brightness, music, battery, timers: call the matching tool.
 - Only use run_command when no other tool can do it.
 
@@ -52,6 +54,10 @@ _FILLER = re.compile(r"\b(let me know|feel free|if you need|would you like|shall
                      r"anything else|happy to help|how can i (help|assist)|how may i)\b", re.I)
 # Tool calls some models write as plain text, e.g. ':focus_window {"name": "Spotify"}'.
 _TEXT_TOOL_CALL = re.compile(r":?\s*`?(\w+)`?\s*(\{[^{}]*\})")
+
+
+# Words that mark a "fact" as the model's guesswork rather than something the user said.
+_SPECULATION = re.compile(r"\b(suggest\w*|reflect\w*|indicat\w*|implies|likely|probably|seems|which means)\b", re.I)
 
 
 def tighten(reply: str) -> str:
@@ -78,6 +84,7 @@ class Brain:
         self.client = ollama.AsyncClient(host=settings.brain.ollama_host)
         self.history: list[dict] = []
         self.last_user_text = ""  # what the user just asked, so tools (like vision) see their real words
+        self.acted = False  # a tool ran during the current reply (so it's not safe to redo it)
 
     def system_prompt(self, context: str = "") -> str:
         p = self.settings.persona
@@ -111,6 +118,7 @@ class Brain:
         """Answer something the user said, using tools as needed."""
         b = self.settings.brain
         self.last_user_text = text
+        self.acted = False
         turns = self.history[-2 * b.history_turns:] if b.history_turns else []
         messages: list = [{"role": "system", "content": self.system_prompt(context)}, *turns,
                           {"role": "user", "content": text}]
@@ -126,6 +134,7 @@ class Brain:
                     reply = (message.content or "").strip()
                     break
             for name, args in calls:
+                self.acted = True
                 result = await self.hands.call(name, args)
                 messages.append({"role": "tool", "content": result, "tool_name": name})
         else:
@@ -165,11 +174,13 @@ class Brain:
         for fact in found if isinstance(found, list) else []:
             # Keep only clean, short facts actually about the user (small models embellish).
             if not isinstance(fact, str) or not fact.lower().startswith(user.lower()) \
-                    or not 3 <= len(fact.split()) <= 25:
+                    or not 3 <= len(fact.split()) <= 16 or _SPECULATION.search(fact):
                 continue
-            new = _words(fact)
-            # Skip near-duplicates of something already known.
-            if any(len(new & _words(k["text"])) / max(len(new), 1) >= 0.75 for k in known):
+            # Skip near-duplicates of something already known (ignoring the name, which may differ).
+            new = _words(fact.split(None, 1)[1])
+            known_words = [_words(k["text"].split(None, 1)[-1]) for k in known]
+            if any(len(new & kw) / max(len(new), 1) >= 0.6 for kw in known_words) or \
+                    len(new & set().union(*known_words)) / max(len(new), 1) >= 0.8:  # just a mash-up of known facts
                 continue
             self.memory.add_fact(fact.strip())
             known.append({"text": fact})

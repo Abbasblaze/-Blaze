@@ -39,9 +39,12 @@ class Bubble(QWidget):
         self.menu.addAction("Stop talking", lambda: client.request("stop"))
         self.mute_action = self.menu.addAction("Mute microphone", lambda: client.request(
             "mute", muted=not self.muted))
+        self.camera_action = self.menu.addAction("Open camera", lambda: client.request(
+            "camera", on=not self.camera_on))
         self.menu.addSeparator()
         self.menu.addAction("Close app (Blaze keeps running)", quit_app)
         self.muted = False
+        self.camera_on = False
 
         client.event.connect(self._on_event)
         client.connection_changed.connect(lambda ok: ok or self._set_state("offline"))
@@ -59,6 +62,8 @@ class Bubble(QWidget):
             self.orb.level = msg.get("mic_level", 0.0)
             self.muted = msg["muted"]
             self.mute_action.setText("Unmute microphone" if self.muted else "Mute microphone")
+            self.camera_on = bool(msg.get("camera_on"))
+            self.camera_action.setText("Close camera" if self.camera_on else "Open camera")
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
