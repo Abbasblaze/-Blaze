@@ -189,11 +189,16 @@ class SettingsPage(QWidget):
         self.allow_commands = QCheckBox("Let Blaze run terminal commands")
         self.confirm_risky = QCheckBox("Ask me before risky actions (recommended)")
         self.search_roots = QLineEdit()
+        self.web_engine = combo(["free", "ollama", "brave"])
+        self.web_key = QLineEdit(echoMode=QLineEdit.EchoMode.Password, placeholderText="only for ollama or brave")
         f.addRow("", self.allow_commands)
         f.addRow("", self.confirm_risky)
         f.addRow("Search folders", self.search_roots)
+        f.addRow("Web search", self.web_engine)
+        f.addRow("Web search API key", self.web_key)
         f.addRow("", hint("Read-only commands like ls or df run straight away; anything else is confirmed "
-                          "first by voice or with the Yes/No bar on the Home page."))
+                          "first by voice or with the Yes/No bar on the Home page. Web search \"free\" needs no "
+                          "account; for ollama or brave, paste an API key from ollama.com or brave.com/search/api."))
 
     def _build_startup(self) -> None:
         f = self._group("Startup")
@@ -251,6 +256,8 @@ class SettingsPage(QWidget):
         self.allow_commands.setChecked(s.hands.allow_commands)
         self.confirm_risky.setChecked(s.hands.confirm_risky)
         self.search_roots.setText(", ".join(s.hands.search_roots))
+        set_combo(self.web_engine, s.hands.web_search_engine)
+        self.web_key.setText(s.hands.web_search_api_key)
 
         self.autostart.blockSignals(True)
         self.autostart.setChecked(user_service("is-enabled").stdout.strip() == "enabled")
@@ -302,7 +309,9 @@ class SettingsPage(QWidget):
                        "break_reminder_minutes": self.break_after.value()},
             "hands": {"allow_commands": self.allow_commands.isChecked(),
                       "confirm_risky": self.confirm_risky.isChecked(),
-                      "search_roots": split(self.search_roots.text()) or ["~"]},
+                      "search_roots": split(self.search_roots.text()) or ["~"],
+                      "web_search_engine": self.web_engine.currentText(),
+                      "web_search_api_key": self.web_key.text().strip()},
         })
 
     def save(self, then=None) -> None:

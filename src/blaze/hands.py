@@ -22,6 +22,7 @@ from pathlib import Path
 
 import psutil
 
+from . import web
 from .memory import Memory
 from .settings import HandsSettings
 
@@ -41,6 +42,8 @@ SAFE_COMMANDS = {
     "hostname", "stat", "file", "tree", "git",
 }
 SHELL_TRICKS = re.compile(r"[;&|<>`$\\]|\bsudo\b")
+# What people (and the model) call "the browser" when they don't name one.
+BROWSER_WORDS = {"browser", "web browser", "the browser", "my browser", "internet", "web", "default browser"}
 
 
 def session_env() -> dict[str, str]:
@@ -63,6 +66,25 @@ def session_env() -> dict[str, str]:
     if sockets and not (runtime / env.get("WAYLAND_DISPLAY", "-")).exists():
         env["WAYLAND_DISPLAY"] = sockets[0].name
     return env
+
+
+def default_browser() -> tuple[str, str]:
+    """The user's default browser as (desktop file id, name), e.g. ("google-chrome", "Google Chrome")."""
+    try:
+        desktop = subprocess.run(["xdg-settings", "get", "default-web-browser"], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return "", "the default browser"
+    for directory in APP_DIRS:
+        path = directory / desktop
+        if desktop and path.is_file():
+            cp = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                cp.read(path, encoding="utf-8")
+                return path.stem, cp["Desktop Entry"].get("Name", path.stem)
+            except (configparser.Error, KeyError, UnicodeDecodeError):
+                break
+    return desktop.removesuffix(".desktop"), desktop.removesuffix(".desktop") or "the default browser"
 
 
 def run(args: list[str], timeout: float = 15) -> str:
@@ -132,6 +154,7 @@ class Hands:
         self._remind = remind
         self._open_camera = open_camera
         self._close_camera = close_camera
+        self.browser_id, self.browser_name = default_browser()
         self.tools = {t.name: t for t in self._define()}
 
     def schemas(self) -> list[dict]:
@@ -193,9 +216,32 @@ class Hands:
             Tool("set_timer", "Remind the user of something after some minutes.", self.set_timer,
                  {"minutes": "how many minutes from now", "message": "what to remind them"},
                  types={"minutes": "number"}),
+            Tool("web_search", "Search the internet. Use for prices, scores, people, releases and any fact "
+                 "you're not sure of.", self.web_search,
+                 {"query": "what to search for, like you'd type it into Google"}),
+            Tool("news", "Latest news headlines about a topic.", self.news,
+                 {"topic": "what the news should be about, e.g. Pakistan cricket"}),
+            Tool("weather", "Current weather and the forecast for the next days.", self.weather,
+                 {"place": "city name"}),
+            Tool("read_webpage", "Read the text of a web page, e.g. a search result, when its snippet isn't enough.",
+                 self.read_webpage, {"url": "the page's full web address"}),
             Tool("run_command", "Run a Linux shell command and return its output. Use only when no other tool fits.",
                  self.run_command, {"command": "the bash command"}),
         ]
+
+    # web -----------------------------------------------------------------------
+
+    async def web_search(self, query: str) -> str:
+        return await web.search(query, self.settings)
+
+    async def read_webpage(self, url: str) -> str:
+        return await web.read_page(url)
+
+    async def news(self, topic: str) -> str:
+        return await web.news(topic)
+
+    async def weather(self, place: str) -> str:
+        return await web.weather(place)
 
     # files ---------------------------------------------------------------------
 
@@ -232,6 +278,8 @@ class Hands:
 
     def open_app(self, name: str) -> str:
         query = name.lower().strip()
+        if query in BROWSER_WORDS:  # "open the browser" means the user's browser, not whichever is installed
+            query = self.browser_name.lower()
         best = None
         for directory in APP_DIRS:
             for path in sorted(directory.glob("*.desktop")) if directory.is_dir() else []:
@@ -267,7 +315,9 @@ class Hands:
             return []
 
     def _find_window(self, name: str) -> dict | None:
-        q = name.lower()
+        q = name.lower().strip()
+        if q in BROWSER_WORDS or q == self.browser_name.lower():
+            q = self.browser_id.lower() or q  # Chrome's window class is "Google-chrome"
         for c in self._clients():
             if q in c.get("class", "").lower() or q in c.get("title", "").lower():
                 return c

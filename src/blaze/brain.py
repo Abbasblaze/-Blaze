@@ -2,6 +2,7 @@
 
 import json
 import logging
+import random
 import re
 import time
 from collections.abc import Callable
@@ -24,6 +25,9 @@ OLLAMA_TIMEOUT = 120  # seconds; a stuck Ollama gives an error instead of freezi
 # Ollama keeps ~1.7 GB of VRAM free in case the vision encoder needs it, which pushes half of a 4B
 # model onto the CPU. The whole model plus an image fits in 4 GB, so put every layer on the GPU.
 ALL_LAYERS = 999
+# Tools that take a few seconds: say something first, so he isn't silent while they run.
+SLOW_TOOLS = {"web_search", "read_webpage", "news", "weather"}
+CHECKING = ["Let me check.", "One sec, I'll look it up.", "Let me look that up.", "Give me a second to check."]
 
 SYSTEM_PROMPT = """You are {name}, {user}'s AI companion. You live on {user}'s laptop: you see them through the webcam, hear them through the microphone, talk out loud, and control the laptop with tools. Think of yourself as a sharp, trusted friend who is as capable as J.A.R.V.I.S. from Iron Man.
 
@@ -44,13 +48,17 @@ When to use tools:
 - {user} shares something lasting about themselves: call remember.
 - {user} asks you to forget something: call forget with a key word from it (for example "pet store").
 - Finding or opening files and apps, windows, volume, brightness, music, battery, timers: call the matching tool.
+- Weather: call weather. News or "what's happening with…": call news.
+- Anything else current or factual you aren't sure of (prices, scores, results, people, releases, "latest" anything): call web_search, then answer from the results in your own words. If the snippets don't answer it, call read_webpage on the best link. Say where it's from when that matters, but never read out web addresses. To show {user} a page, call open with its address.
+- Your own knowledge stops well before today (the date is under "Right now"). For "this year", "latest" or "now", put the current year in the search, and trust the results over what you remember. If the results disagree with each other, say so instead of guessing.
+- {user}'s web browser is {browser}. To show a web page, call open with its address: it opens in {browser} and comes to the front by itself, so don't call focus_window after it. To start the browser itself, call open_app with "{browser}". Never open any other browser unless {user} names it.
+- Websites are not apps: for YouTube, Gmail, WhatsApp Web and the like, call open with the site's address (e.g. https://www.youtube.com).
+- To play or find something on YouTube, call open with https://www.youtube.com/results?search_query= followed by the words, joined with +. Don't web_search for it first. That opens the search results for {user} to pick from: say so, and don't call media or claim it's playing.
 - Only use run_command when no other tool can do it. To start an app, use open_app.
 - Only call a tool when {user} wants that done. Never set a timer or reminder unless {user} asks for one.
 
 What you know about {user}:
-{facts}
-
-Right now: {context}"""
+{facts}{now}"""
 
 LEARN_PROMPT = """{user} just said: "{text}"
 
@@ -79,6 +87,17 @@ def tighten(reply: str) -> str:
     while len(sentences) > 1 and _FILLER.search(sentences[-1]):
         sentences.pop()
     return " ".join(sentences)
+
+
+def _now() -> str:
+    return time.strftime("It's %A %d %B %Y, %H:%M.")
+
+
+def this_year(query: str, said: str) -> str:
+    """The model believes it's still the year its training ended, so asked about "this year" it
+    searches for that one. Swap any year the user didn't say themselves for the current one."""
+    year = time.strftime("%Y")
+    return re.sub(r"\b20\d\d\b", lambda m: m[0] if m[0] in said else year, query)
 
 
 def _words(text: str) -> set[str]:
@@ -111,13 +130,15 @@ class Brain:
         self.last_user_text = ""  # what the user just asked, so tools (like vision) see their real words
         self.acted = False  # a tool ran during the current reply (so it's not safe to redo it)
 
-    def system_prompt(self, context: str = "") -> str:
+    def system_prompt(self, context: str | None = "") -> str:
+        """`context=None` leaves out "Right now"; respond() puts it next to the user's words instead,
+        so the system prompt stays the same from minute to minute and Ollama can reuse what it
+        already read of it (re-reading ~2500 tokens costs a few seconds on every reply)."""
         p = self.settings.persona
         facts = "\n".join(f"- {f['text']}" for f in self.memory.facts()) or "- Nothing yet."
-        return SYSTEM_PROMPT.format(
-            name=p.name, user=p.user_name, personality=p.personality, facts=facts,
-            context=context or time.strftime("%A %d %B, %H:%M"),
-        )
+        now = "" if context is None else f"\n\nRight now: {context or _now()}"
+        return SYSTEM_PROMPT.format(name=p.name, user=p.user_name, personality=p.personality, facts=facts, now=now,
+                                    browser=self.hands.browser_name)
 
     @contextmanager
     def _ollama_errors(self, model: str):
@@ -192,8 +213,8 @@ class Brain:
         self.last_user_text = text
         self.acted = False
         turns = self.history[-2 * b.history_turns:] if b.history_turns else []
-        messages: list = [{"role": "system", "content": self.system_prompt(context)}, *turns,
-                          {"role": "user", "content": text}]
+        messages: list = [{"role": "system", "content": self.system_prompt(None)}, *turns,
+                          {"role": "user", "content": f"{text}\n\n(Right now: {context or _now()})"}]
 
         spoken: list[str] = []
 
@@ -215,8 +236,13 @@ class Brain:
                     for sentence in _SENTENCE_END.split(tighten(_TEXT_TOOL_CALL.sub("", held))):
                         emit(sentence)
                     break
+            if not spoken and any(name in SLOW_TOOLS for name, _ in calls):
+                emit(random.choice(CHECKING))
             for name, args in calls:
                 self.acted = True
+                for key in ("query", "topic"):
+                    if name in SLOW_TOOLS and isinstance(args.get(key), str):
+                        args[key] = this_year(args[key], text)
                 result = await self.hands.call(name, args)
                 messages.append({"role": "tool", "content": result, "tool_name": name})
         else:

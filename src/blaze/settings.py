@@ -73,6 +73,9 @@ class HandsSettings(BaseModel):
     allow_commands: bool = True
     confirm_risky: bool = True
     search_roots: list[str] = ["~"]
+    # "free" needs no account; "ollama" and "brave" use their search APIs with an API key.
+    web_search_engine: Literal["free", "ollama", "brave"] = "free"
+    web_search_api_key: str = ""
 
 
 class Settings(BaseModel):
