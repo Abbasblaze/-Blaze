@@ -12,8 +12,9 @@ from collections.abc import AsyncIterator, Callable
 from typing import NamedTuple
 
 import numpy as np
+import onnxruntime
 import sounddevice as sd
-import webrtcvad
+from faster_whisper.utils import get_assets_path
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,41 @@ END_RATIO = 0.9
 MIN_SPEECH_FRAMES = 10  # ignore blips shorter than 300 ms
 MAX_UTTERANCE_FRAMES = 20_000 // FRAME_MS  # 20 s
 
+# Silero's speech threshold for each aggressiveness setting (higher = needs clearer speech).
+VAD_THRESHOLDS = {0: 0.3, 1: 0.4, 2: 0.5, 3: 0.65}
+
+
+class SileroVad:
+    """Silero voice detection, fed the mic stream as it arrives. Unlike WebRTC's detector it isn't
+    fooled by typing, clicks or fans, so those don't count as you talking."""
+
+    CHUNK = 512  # samples per Silero step at 16 kHz
+    CONTEXT = 64  # samples of the previous step it also looks at
+
+    def __init__(self, threshold: float):
+        opts = onnxruntime.SessionOptions()
+        opts.inter_op_num_threads = opts.intra_op_num_threads = 1
+        opts.log_severity_level = 4
+        self.session = onnxruntime.InferenceSession(
+            f"{get_assets_path()}/silero_vad_v6.onnx", providers=["CPUExecutionProvider"], sess_options=opts)
+        self.threshold = threshold
+        self._h = np.zeros((1, 1, 128), dtype=np.float32)
+        self._c = np.zeros((1, 1, 128), dtype=np.float32)
+        self._context = np.zeros(self.CONTEXT, dtype=np.float32)
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._prob = 0.0
+
+    def is_speech(self, samples: np.ndarray) -> bool:
+        """Feed one frame of int16 audio; True if the latest audio sounds like a voice."""
+        self._pending = np.concatenate([self._pending, samples.astype(np.float32) / 32768.0])
+        while len(self._pending) >= self.CHUNK:
+            chunk, self._pending = self._pending[:self.CHUNK], self._pending[self.CHUNK:]
+            x = np.concatenate([self._context, chunk])[None, :]
+            out, self._h, self._c = self.session.run(None, {"input": x, "h": self._h, "c": self._c})
+            self._context = chunk[-self.CONTEXT:]
+            self._prob = float(np.ravel(out)[0])
+        return self._prob >= self.threshold
+
 
 class Utterance(NamedTuple):
     audio: np.ndarray  # int16, 16 kHz mono
@@ -37,7 +73,7 @@ class Utterance(NamedTuple):
 class Ears:
     def __init__(self, device: str = "", aggressiveness: int = 2):
         self.device = device or None
-        self.vad = webrtcvad.Vad(aggressiveness)
+        self.vad = SileroVad(VAD_THRESHOLDS.get(aggressiveness, 0.5))
         self.muted = False  # set while Blaze is speaking (on speakers) so he doesn't hear himself
         self.on_speech_start: Callable[[], None] | None = None  # lets the user interrupt him
         self._current: list[bytes] | None = None  # the utterance being heard right now
@@ -114,7 +150,7 @@ class Ears:
                 voiced, speaking, self._current = [], False, None
                 continue
 
-            is_speech = self.vad.is_speech(frame, SAMPLE_RATE)
+            is_speech = self.vad.is_speech(samples)
             if not speaking:
                 recent.append((frame, is_speech))
                 if len(recent) == START_WINDOW and sum(s for _, s in recent) >= START_RATIO * START_WINDOW:

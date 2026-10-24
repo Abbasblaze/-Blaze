@@ -19,6 +19,11 @@ from .settings import Settings
 log = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 5
+KEEP_ALIVE = -1  # never unload the model: reloading it after a break makes the next reply slow
+OLLAMA_TIMEOUT = 120  # seconds; a stuck Ollama gives an error instead of freezing Blaze
+# Ollama keeps ~1.7 GB of VRAM free in case the vision encoder needs it, which pushes half of a 4B
+# model onto the CPU. The whole model plus an image fits in 4 GB, so put every layer on the GPU.
+ALL_LAYERS = 999
 
 SYSTEM_PROMPT = """You are {name}, {user}'s AI companion. You live on {user}'s laptop: you see them through the webcam, hear them through the microphone, talk out loud, and control the laptop with tools. Think of yourself as a sharp, trusted friend who is as capable as J.A.R.V.I.S. from Iron Man.
 
@@ -39,7 +44,8 @@ When to use tools:
 - {user} shares something lasting about themselves: call remember.
 - {user} asks you to forget something: call forget with a key word from it (for example "pet store").
 - Finding or opening files and apps, windows, volume, brightness, music, battery, timers: call the matching tool.
-- Only use run_command when no other tool can do it.
+- Only use run_command when no other tool can do it. To start an app, use open_app.
+- Only call a tool when {user} wants that done. Never set a timer or reminder unless {user} asks for one.
 
 What you know about {user}:
 {facts}
@@ -99,7 +105,8 @@ class Brain:
         self.settings = settings
         self.hands = hands
         self.memory = memory
-        self.client = ollama.AsyncClient(host=settings.brain.ollama_host)
+        self.client = ollama.AsyncClient(host=settings.brain.ollama_host, timeout=OLLAMA_TIMEOUT)
+        self.gpu_layers: int | None = ALL_LAYERS  # None = let Ollama decide (if all of them didn't fit)
         self.history: list[dict] = []
         self.last_user_text = ""  # what the user just asked, so tools (like vision) see their real words
         self.acted = False  # a tool ran during the current reply (so it's not safe to redo it)
@@ -118,13 +125,25 @@ class Brain:
             yield
         except (httpx.ConnectError, ConnectionError) as e:
             raise BrainUnavailable("I can't reach Ollama. Is it running?") from e
+        except httpx.TimeoutException as e:
+            raise BrainUnavailable("My brain took too long to answer.") from e
         except ollama.ResponseError as e:
             if e.status_code == 404:
                 raise BrainUnavailable(f"The model {model} isn't installed. Run: ollama pull {model}") from e
+            if self.gpu_layers is not None and e.status_code == 500:
+                # Most likely the GPU is short on memory (another app is using it): fall back to
+                # letting Ollama split the model between GPU and CPU from now on.
+                log.warning("Ollama failed with all layers on the GPU (%s); letting it decide", e.error)
+                self.gpu_layers = None
+                raise BrainUnavailable("I had to reload my brain. Say that again?") from e
             raise BrainUnavailable(f"Ollama error: {e.error}") from e
 
     def _options(self, json_output: bool = False) -> dict:
-        return {"temperature": 0.1 if json_output else self.settings.brain.temperature}
+        # Every call must use the same load options (GPU layers, context), or Ollama reloads the model.
+        options = {"temperature": 0.1 if json_output else self.settings.brain.temperature, "num_ctx": 4096}
+        if self.gpu_layers is not None:
+            options["num_gpu"] = self.gpu_layers
+        return options
 
     async def _chat(self, model: str, messages: list, tools: list | None = None,
                     json_output: bool = False) -> ollama.Message:
@@ -136,7 +155,7 @@ class Brain:
                 format="json" if json_output else None,
                 options=self._options(json_output),
                 think=False,  # "thinking" models are too slow for a voice conversation
-                keep_alive="1h",
+                keep_alive=KEEP_ALIVE,
             )
         return response.message
 
@@ -149,7 +168,7 @@ class Brain:
         with self._ollama_errors(model):
             async for chunk in await self.client.chat(model=model, messages=messages, tools=tools,
                                                       options=self._options(), think=False,
-                                                      keep_alive="1h", stream=True):
+                                                      keep_alive=KEEP_ALIVE, stream=True):
                 calls += chunk.message.tool_calls or []
                 content += chunk.message.content or ""
                 if "{" in content:

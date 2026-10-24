@@ -10,12 +10,12 @@ dependencies = [
     "kokoro-onnx>=0.4",
     "numpy>=1.26",
     "ollama>=0.4",
+    "onnxruntime>=1.18",
     "opencv-python-headless>=4.10",
     "psutil>=6.0",
     "pydantic>=2.8",
     "pyside6-essentials>=6.7",
     "sounddevice>=0.5",
-    "webrtcvad-wheels>=2.0.14",
 ]
 
 [project.scripts]

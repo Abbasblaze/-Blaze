@@ -32,6 +32,10 @@ YES = re.compile(r"\b(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|confirm|pleas
 NO = re.compile(r"\b(no|nope|don't|do not|stop|cancel|never mind|wait)\b", re.I)
 ECHO_DELAY = 0.6  # seconds of your speech to hear before deciding whether to stop talking
 END_OF_TURN = 0.6  # extra quiet after you finish (on top of the mic's own pause) before he answers
+MAX_HOLD = 2.5  # never wait longer than this after your last words for "more" (background voices)
+STILL_TALKING = 4.0  # speech starting this soon after your last words is you carrying on, not someone else
+REPLY_TIMEOUT = 180  # seconds; a reply that takes longer is given up, so Blaze can never freeze
+WAKE_CHECK_SECONDS = 4  # how much of a long utterance gets re-checked for a misheard "Blaze"
 
 
 def is_echo(heard: str, said: str) -> bool:
@@ -88,6 +92,8 @@ class Blaze:
         self._answer_text = ""
         self._transcribing = False
         self._last_speech_end = 0.0
+        self._last_heard = 0.0  # when your last words to him were heard
+        self._finish_speaking = None  # set during a reply: says what's queued so far, then frees the speaker
 
         self.voice = Voice(self.settings.voice)
         self.stt: Transcriber | None = None
@@ -303,10 +309,25 @@ class Blaze:
                     speaker = asyncio.create_task(self._speak_from(sentences))
                 sentences.put_nowait(sentence)
 
+            async def finish_speaking() -> None:
+                # A tool needs the speaker mid-reply (to ask "Should I…?"). The reply's speaker holds
+                # it until the reply ends, so let it finish what it has and start a new one after.
+                nonlocal speaker, sentences
+                if speaker:
+                    sentences.put_nowait(None)
+                    await speaker
+                    speaker, sentences = None, asyncio.Queue()
+                    self.set_state("thinking")
+
+            self._finish_speaking = finish_speaking
             try:
-                reply = await self.brain.respond(text, self.context(), on_sentence if speak else None)
+                async with asyncio.timeout(REPLY_TIMEOUT):
+                    reply = await self.brain.respond(text, self.context(), on_sentence if speak else None)
             except BrainUnavailable as e:
                 reply = str(e)
+            except TimeoutError:
+                log.error("Gave up on a reply after %d s", REPLY_TIMEOUT)
+                reply = "Sorry, that took me way too long. Let's try again."
             except asyncio.CancelledError:  # you kept talking; the answer will be redone with everything
                 if speaker:
                     self.voice.stop()
@@ -317,6 +338,8 @@ class Blaze:
             except Exception:
                 log.exception("Thinking failed")
                 reply = "Sorry, something went wrong in my head. Check my logs."
+            finally:
+                self._finish_speaking = None
             if speaker:
                 sentences.put_nowait(None)
                 log.info("Saying: %s", reply)
@@ -334,6 +357,7 @@ class Blaze:
     def _hear(self, text: str) -> None:
         """You said something to him: answer once you've finished talking."""
         self.awake_until = float("inf")  # you're talking to him now, so the rest of your sentence counts too
+        self._last_heard = time.monotonic()
         self._post("user", text)
         self._pending.append(text)
         if self._waiter is None or self._waiter.done():
@@ -343,10 +367,13 @@ class Blaze:
         return bool(self.ears and self.ears.in_speech) or self._transcribing
 
     async def _answer_when_done(self) -> None:
-        """Wait until you've really finished (not just paused), then answer it all as one message."""
+        """Wait until you've really finished (not just paused), then answer it all as one message.
+        Voices in the background (a video, someone else in the room) could keep him waiting
+        forever, so he waits at most MAX_HOLD after your last words."""
         while True:
             await asyncio.sleep(0.1)
-            if self._you_are_talking() or time.monotonic() - self._last_speech_end < END_OF_TURN:
+            waiting = self._you_are_talking() or time.monotonic() - self._last_speech_end < END_OF_TURN
+            if waiting and time.monotonic() - self._last_heard < MAX_HOLD:
                 continue
             if self._answer_task and not self._answer_task.done():
                 await asyncio.wait({self._answer_task})  # let the current answer finish, then re-check
@@ -392,7 +419,8 @@ class Blaze:
         if self.voice.speaking:
             log.info("Interrupted by: %s", heard)
             self.voice.stop()
-        elif task and not task.done() and self.state == "thinking" and not self.brain.acted:
+        elif task and not task.done() and self.state == "thinking" and not self.brain.acted \
+                and time.monotonic() - self._last_heard < STILL_TALKING:
             # You weren't finished: drop the half-made answer and redo it with everything you say.
             log.info("You're still talking (%s) — holding my answer", heard)
             task.cancel()
@@ -406,8 +434,14 @@ class Blaze:
         text = await asyncio.to_thread(self.stt.transcribe, audio)
         if not text or in_conversation or self._strip_wake_word(text) is not None:
             return text
-        hinted = await asyncio.to_thread(self.stt.transcribe, audio, self.settings.persona.name)
-        return hinted if self._strip_wake_word(hinted) is not None else text
+        # Re-check only the start ("Hey Blaze, …"), so background chatter doesn't cost a second
+        # full transcription that keeps the CPU busy and him deaf to you.
+        name = self.settings.persona.name
+        head = audio[:WAKE_CHECK_SECONDS * 16000]
+        hinted = await asyncio.to_thread(self.stt.transcribe, head, name)
+        if self._strip_wake_word(hinted) is None:
+            return text
+        return hinted if len(head) == len(audio) else await asyncio.to_thread(self.stt.transcribe, audio, name)
 
     async def wake(self) -> None:
         self.awake_until = time.monotonic() + max(self.settings.listening.follow_up_seconds, 6)
@@ -474,6 +508,8 @@ class Blaze:
 
     async def confirm(self, action: str) -> bool:
         """Ask before doing something risky. Answer by voice or in the app."""
+        if self._finish_speaking:
+            await self._finish_speaking()
         self._confirm = self.loop.create_future()
         self.ipc.broadcast("confirm", question=f"Should I {action}?")
         spoken = action if len(action) < 90 else action[:90] + "…"
