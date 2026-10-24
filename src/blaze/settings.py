@@ -28,8 +28,8 @@ class PersonaSettings(BaseModel):
 
 class BrainSettings(BaseModel):
     ollama_host: str = "http://127.0.0.1:11434"
-    model: str = "qwen2.5:3b"
-    vision_model: str = "moondream:1.8b"
+    model: str = "qwen3.5:4b"
+    vision_model: str = "qwen3.5:4b"
     temperature: float = Field(0.7, ge=0.0, le=2.0)
     history_turns: int = Field(10, ge=0, le=50)
 

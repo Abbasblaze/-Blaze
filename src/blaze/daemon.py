@@ -75,6 +75,7 @@ class Blaze:
         self.muted = not self.settings.listening.enabled
         self.awake_until = 0.0  # follow-up window: listen without the wake word until then
         self.camera_on = False  # closed until you ask him to open it
+        self._camera_opened = 0.0
         self.last_glance: tuple[float, str] | None = None
         self.last_break_reminder = 0.0
         self.recent: collections.deque[dict] = collections.deque(maxlen=50)  # chat shown in the app
@@ -259,13 +260,26 @@ class Blaze:
             return
         log.info("Saying: %s", text)
         self._post("blaze", text)
+        sentences: asyncio.Queue[str | None] = asyncio.Queue()
+        sentences.put_nowait(text)
+        sentences.put_nowait(None)
+        await self._speak_from(sentences)
+
+    async def _speak_from(self, sentences: asyncio.Queue[str | None]) -> None:
+        """Say each sentence put on the queue, as it comes, until a None."""
         # On headphones the mic stays open so you can talk over him; on speakers he'd hear himself.
         if self.ears and not self.settings.listening.interruptible:
             self.ears.muted = True
         self.set_state("speaking")
-        self._said, self._echo_until = text, float("inf")
+        self._said, self._echo_until = "", float("inf")
+
+        async def lines():
+            while (sentence := await sentences.get()) is not None:
+                self._said += " " + sentence
+                yield sentence
+
         try:
-            await self.voice.say(text)
+            await self.voice.say_stream(lines())
         finally:
             self._echo_until = time.monotonic() + 0.5
             if self.ears:
@@ -278,18 +292,37 @@ class Blaze:
             if post:
                 self._post("user", text)
             self.set_state("thinking")
+            # Start talking as soon as the first sentence is written, instead of after the whole reply.
+            sentences: asyncio.Queue[str | None] = asyncio.Queue()
+            speaker: asyncio.Task | None = None
+
+            def on_sentence(sentence: str) -> None:
+                nonlocal speaker
+                if speaker is None:
+                    self.set_state("speaking")
+                    speaker = asyncio.create_task(self._speak_from(sentences))
+                sentences.put_nowait(sentence)
+
             try:
-                reply = await self.brain.respond(text, self.context())
+                reply = await self.brain.respond(text, self.context(), on_sentence if speak else None)
             except BrainUnavailable as e:
                 reply = str(e)
             except asyncio.CancelledError:  # you kept talking; the answer will be redone with everything
+                if speaker:
+                    self.voice.stop()
+                    speaker.cancel()
                 self.awake_until = time.monotonic() + self.settings.listening.follow_up_seconds
                 self.set_state(self._resting_state())
                 raise
             except Exception:
                 log.exception("Thinking failed")
                 reply = "Sorry, something went wrong in my head. Check my logs."
-            if speak:
+            if speaker:
+                sentences.put_nowait(None)
+                log.info("Saying: %s", reply)
+                self._post("blaze", reply)
+                await speaker
+            elif speak:
                 await self.speak(reply)
             else:
                 self._post("blaze", reply)
@@ -461,6 +494,7 @@ class Blaze:
             return "The camera is turned off in Settings, so I can't open it."
         if on != self.camera_on:
             self.camera_on = on
+            self._camera_opened = time.monotonic()
             await asyncio.to_thread(self._start_eyes)
             if not on:
                 self.last_glance = None
@@ -468,6 +502,8 @@ class Blaze:
             self.publish_status()
         if on and not await self._wait_for_picture():
             return "I opened the camera but I'm not getting a picture from it."
+        if on and time.monotonic() - self._camera_opened < 1.5:
+            await asyncio.sleep(1.5 - (time.monotonic() - self._camera_opened))  # let the exposure settle
         return "The camera is open." if on else "The camera is closed."
 
     async def _wait_for_picture(self, timeout: float = 6.0) -> bool:
@@ -497,7 +533,6 @@ class Blaze:
             result = await self.set_camera(True)
             if result != "The camera is open.":
                 return result
-            await asyncio.sleep(1.0)  # let the webcam settle its exposure
         if not (self.eyes and self.eyes.camera_ok):
             return "The camera isn't working."
         image = self.eyes.snapshot_jpeg()

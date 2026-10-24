@@ -4,8 +4,12 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
+from contextlib import contextmanager
 
+import cv2
 import httpx
+import numpy as np
 import ollama
 
 from .hands import Hands
@@ -22,7 +26,7 @@ Your personality: {personality}
 
 How you talk:
 - Like a real person in a relaxed conversation: warm, natural, a little humor when it fits. Match {user}'s mood.
-- Short: usually one or two sentences. Go longer only when {user} wants an explanation or a solution.
+- Short: usually one or two sentences, under about 35 words. Go longer only when {user} wants an explanation or a solution.
 - When {user} asks something or shares a problem, give a real, specific answer: your best recommendation and the concrete next step, not a menu of options.
 - Don't tack on offers like "Would you like me to...", "Let me know if..." or "How can I help?". Asking a question is fine when you genuinely need to know something, or when it's natural in casual chat.
 - Plain spoken sentences only: no markdown, lists, emojis or code.
@@ -56,6 +60,9 @@ _FILLER = re.compile(r"\b(let me know|feel free|if you need|would you like|shall
 _TEXT_TOOL_CALL = re.compile(r":?\s*`?(\w+)`?\s*(\{[^{}]*\})")
 
 
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
 # Words that mark a "fact" as the model's guesswork rather than something the user said.
 _SPECULATION = re.compile(r"\b(suggest\w*|reflect\w*|indicat\w*|implies|likely|probably|seems|which means)\b", re.I)
 
@@ -76,6 +83,17 @@ class BrainUnavailable(Exception):
     pass
 
 
+def shrink(image: bytes, max_side: int = 1024) -> bytes:
+    """Scale an image down so it fits the model's context (a full-size screenshot doesn't) and is quick to read."""
+    frame = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None or max(frame.shape[:2]) <= max_side:
+        return image
+    scale = max_side / max(frame.shape[:2])
+    frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return buf.tobytes() if ok else image
+
+
 class Brain:
     def __init__(self, settings: Settings, hands: Hands, memory: Memory):
         self.settings = settings
@@ -94,28 +112,63 @@ class Brain:
             context=context or time.strftime("%A %d %B, %H:%M"),
         )
 
-    async def _chat(self, model: str, messages: list, tools: list | None = None,
-                    json_output: bool = False) -> ollama.Message:
+    @contextmanager
+    def _ollama_errors(self, model: str):
         try:
-            response = await self.client.chat(
-                model=model,
-                messages=messages,
-                tools=tools,
-                format="json" if json_output else None,
-                options={"temperature": 0.1 if json_output else self.settings.brain.temperature},
-                think=False,  # "thinking" models are too slow for a voice conversation
-                keep_alive="1h",
-            )
+            yield
         except (httpx.ConnectError, ConnectionError) as e:
             raise BrainUnavailable("I can't reach Ollama. Is it running?") from e
         except ollama.ResponseError as e:
             if e.status_code == 404:
                 raise BrainUnavailable(f"The model {model} isn't installed. Run: ollama pull {model}") from e
             raise BrainUnavailable(f"Ollama error: {e.error}") from e
+
+    def _options(self, json_output: bool = False) -> dict:
+        return {"temperature": 0.1 if json_output else self.settings.brain.temperature}
+
+    async def _chat(self, model: str, messages: list, tools: list | None = None,
+                    json_output: bool = False) -> ollama.Message:
+        with self._ollama_errors(model):
+            response = await self.client.chat(
+                model=model,
+                messages=messages,
+                tools=tools,
+                format="json" if json_output else None,
+                options=self._options(json_output),
+                think=False,  # "thinking" models are too slow for a voice conversation
+                keep_alive="1h",
+            )
         return response.message
 
-    async def respond(self, text: str, context: str = "") -> str:
-        """Answer something the user said, using tools as needed."""
+    async def _chat_streaming(self, model: str, messages: list, tools: list,
+                              emit: Callable[[str], None]) -> tuple[ollama.Message, str]:
+        """Like _chat, but hands over each sentence as soon as it's written, so Blaze can start
+        talking while the rest is still coming. Returns the message and any text held back: from
+        a "{" on it may be a tool call written out, which mustn't be read aloud."""
+        content, calls, sent = "", [], 0
+        with self._ollama_errors(model):
+            async for chunk in await self.client.chat(model=model, messages=messages, tools=tools,
+                                                      options=self._options(), think=False,
+                                                      keep_alive="1h", stream=True):
+                calls += chunk.message.tool_calls or []
+                content += chunk.message.content or ""
+                if "{" in content:
+                    continue
+                ends = list(_SENTENCE_END.finditer(content, sent))
+                if ends:
+                    for sentence in _SENTENCE_END.split(content[sent:ends[-1].start()]):
+                        emit(sentence)
+                    sent = ends[-1].end()
+        held = content[sent:]
+        if "{" not in held:
+            emit(held)
+            held = ""
+        return ollama.Message(role="assistant", content=content, tool_calls=calls or None), held
+
+    async def respond(self, text: str, context: str = "",
+                      on_sentence: Callable[[str], None] | None = None) -> str:
+        """Answer something the user said, using tools as needed. `on_sentence` gets the reply
+        one sentence at a time while it's being written, so it can be spoken straight away."""
         b = self.settings.brain
         self.last_user_text = text
         self.acted = False
@@ -123,23 +176,35 @@ class Brain:
         messages: list = [{"role": "system", "content": self.system_prompt(context)}, *turns,
                           {"role": "user", "content": text}]
 
-        reply = ""
+        spoken: list[str] = []
+
+        def emit(sentence: str) -> None:
+            sentence = sentence.strip()
+            if not sentence or (spoken and _FILLER.search(sentence)):  # drop tacked-on offers
+                return
+            spoken.append(sentence)
+            if on_sentence:
+                on_sentence(sentence)
+
         for _ in range(MAX_TOOL_ROUNDS):
-            message = await self._chat(b.model, messages, self.hands.schemas())
+            message, held = await self._chat_streaming(b.model, messages, self.hands.schemas(), emit)
             messages.append(message)
             calls = [(c.function.name, dict(c.function.arguments or {})) for c in message.tool_calls or []]
             if not calls:
                 calls = self._text_tool_calls(message.content or "")
                 if not calls:
-                    reply = (message.content or "").strip()
+                    for sentence in _SENTENCE_END.split(tighten(_TEXT_TOOL_CALL.sub("", held))):
+                        emit(sentence)
                     break
             for name, args in calls:
                 self.acted = True
                 result = await self.hands.call(name, args)
                 messages.append({"role": "tool", "content": result, "tool_name": name})
         else:
-            reply = "Sorry, I got a bit tangled up trying to do that."
-        reply = tighten(_TEXT_TOOL_CALL.sub("", reply)) or "I don't have a clear answer to that."
+            emit("Sorry, I got a bit tangled up trying to do that.")
+        if not spoken:
+            emit("I don't have a clear answer to that.")
+        reply = " ".join(spoken)
 
         self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
         self.history = self.history[-100:]
@@ -160,6 +225,8 @@ class Brain:
 
     async def learn(self, text: str) -> list[str]:
         """Pick out lasting facts about the user from what they said, and remember them."""
+        if len(text.split()) < 5:  # "yeah", "open Spotify": nothing to learn, and it would hold up the next reply
+            return []
         user = self.settings.persona.user_name
         known = self.memory.facts()
         prompt = LEARN_PROMPT.format(user=user, text=text,
@@ -201,7 +268,7 @@ class Brain:
 
     async def see(self, image: bytes, question: str) -> str:
         """Ask the vision model about an image."""
-        messages = [{"role": "user", "content": question or "Describe this image.", "images": [image]}]
+        messages = [{"role": "user", "content": question or "Describe this image.", "images": [shrink(image)]}]
         message = await self._chat(self.settings.brain.vision_model, messages)
         return (message.content or "").strip() or "I couldn't make anything out."
 

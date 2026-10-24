@@ -7,6 +7,7 @@ current one plays, so Blaze starts talking quickly even on long replies.
 import asyncio
 import logging
 import re
+from collections.abc import AsyncIterator
 
 import httpx
 import numpy as np
@@ -24,6 +25,7 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 RATE = 24000  # Kokoro and our ElevenLabs format both produce 24 kHz audio
 SENTENCE_GAP = np.zeros(int(RATE * 0.12), dtype=np.float32)
+_DONE = object()
 
 
 def split_sentences(text: str) -> list[str]:
@@ -104,31 +106,43 @@ class Voice:
             await asyncio.to_thread(stream.write, audio[start:start + chunk])
 
     async def say(self, text: str) -> None:
+        async def once():
+            yield text
+        await self.say_stream(once())
+
+    async def say_stream(self, texts: AsyncIterator[str]) -> None:
+        """Speak text as it arrives, e.g. while the brain is still writing the rest of the reply."""
         if self.settings.engine == "off":
-            return
-        sentences = split_sentences(text)
-        if not sentences:
+            async for _ in texts:
+                pass
             return
         async with self._lock:
             self._stop.clear()
             self.speaking = True
-            upcoming = asyncio.create_task(self._synth(sentences[0]))
+            ready: asyncio.Queue = asyncio.Queue(maxsize=1)  # synthesize ahead while the current sentence plays
+
+            async def synthesize():
+                async for text in texts:
+                    for sentence in split_sentences(text):
+                        await ready.put(await self._synth(sentence))
+                await ready.put(_DONE)
+
+            producer = asyncio.create_task(synthesize())
             stream = None
             try:
                 stream = self._open_stream()
-                for i in range(len(sentences)):
-                    result = await upcoming
-                    if i + 1 < len(sentences):
-                        upcoming = asyncio.create_task(self._synth(sentences[i + 1]))
+                while (result := await ready.get()) is not _DONE:
                     if self._stop.is_set():
                         break
                     if result is not None:
                         await self._play(stream, *result)
                         await self._play(stream, SENTENCE_GAP, RATE)
+                else:
+                    await producer  # surface any error from reading the text
             except Exception:
                 log.exception("Playback failed")
             finally:
-                upcoming.cancel()
+                producer.cancel()
                 if stream is not None:
                     # stop() lets buffered audio finish; abort() cuts it off when asked to stop.
                     await asyncio.to_thread(stream.abort if self._stop.is_set() else stream.stop)

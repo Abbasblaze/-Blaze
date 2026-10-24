@@ -45,11 +45,15 @@ class Ears:
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
 
     def _open_stream(self, loop: asyncio.AbstractEventLoop) -> sd.RawInputStream:
+        def push(frame: bytes) -> None:
+            if not self._queue.full():  # loop is behind; dropping audio is fine
+                self._queue.put_nowait(frame)
+
         def callback(data, frames, time_info, status):
             try:
-                loop.call_soon_threadsafe(self._queue.put_nowait, bytes(data))
-            except (asyncio.QueueFull, RuntimeError):
-                pass  # loop is behind or shutting down; dropping audio is fine
+                loop.call_soon_threadsafe(push, bytes(data))
+            except RuntimeError:
+                pass  # loop is shutting down
 
         stream = sd.RawInputStream(
             samplerate=SAMPLE_RATE,
