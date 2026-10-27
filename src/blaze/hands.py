@@ -23,7 +23,7 @@ from pathlib import Path
 
 import psutil
 
-from . import web
+from . import clipboard, web
 from .memory import Memory
 from .reminders import describe, parse_when
 from .settings import HandsSettings
@@ -44,6 +44,25 @@ SAFE_COMMANDS = {
     "hostname", "stat", "file", "tree", "git",
 }
 SHELL_TRICKS = re.compile(r"[;&|<>`$\\]|\bsudo\b")
+# Clipboard text, in characters, the model can take at once (its context is ~4000 tokens, and a
+# translation into a non-Latin script like Urdu takes several times the tokens of the English).
+SUMMARY_CHUNK = 10_000
+REWRITE_CHUNK = {"translate": 2_500, "fix": 5_000, "rewrite": 4_000}
+MAX_REWRITE = 6_000  # longer than this would take minutes: ask for a smaller piece
+MAX_SUMMARY = 40_000
+CLIPBOARD_TASKS = {
+    "summarize": "Summarize this in two or three short, plain sentences that can be read out loud.",
+    "explain": "Explain simply what this is and what it means, in a few short sentences that can be read "
+               "out loud. If it's an error message, say what most likely caused it and how to fix it.",
+    "translate": "Translate this into {detail}. Keep names, numbers and code as they are.",
+    "fix": "Correct every spelling, grammar and punctuation mistake, including wrong verb forms, plurals and "
+           "pronouns (\"me and him went\" → \"he and I went\"). Keep the meaning, tone and formatting, and "
+           "don't reword sentences that are already correct. If it's all correct, return it unchanged.",
+    "rewrite": "Rewrite this: {detail}. Keep the meaning.",
+}
+# Lead-ins small models put before the result ("Here's the corrected text:").
+_LEAD_IN = re.compile(r"^\s*(?:sure[,!.]?\s*)?(?:here(?:'s| is| are)\b[^\n:]{0,60}|(?:the )?(?:corrected|fixed|"
+                      r"translated|rewritten|revised) (?:text|version)[^\n:]{0,40}):\s*\n*", re.I)
 # What people (and the model) call "the browser" when they don't name one.
 BROWSER_WORDS = {"browser", "web browser", "the browser", "my browser", "internet", "web", "default browser"}
 
@@ -144,6 +163,8 @@ class Hands:
         confirm: Callable[[str], Awaitable[bool]],
         look_camera: Callable[[str], Awaitable[str]],
         look_screen: Callable[[str], Awaitable[str]],
+        rewrite: Callable[[str, str], Awaitable[str]],
+        see: Callable[[bytes, str], Awaitable[str]],
         open_camera: Callable[[], Awaitable[str]],
         close_camera: Callable[[], Awaitable[str]],
     ):
@@ -152,6 +173,8 @@ class Hands:
         self.confirm = confirm
         self._look_camera = look_camera
         self._look_screen = look_screen
+        self._rewrite = rewrite
+        self._see = see
         self._open_camera = open_camera
         self._close_camera = close_camera
         self.browser_id, self.browser_name = default_browser()
@@ -219,6 +242,12 @@ class Hands:
             Tool("list_reminders", "The reminders that are still waiting to go off.", self.list_reminders),
             Tool("cancel_reminder", "Cancel waiting reminders.", self.cancel_reminder,
                  {"text": "a word from the reminder, e.g. 'mom', or 'all' to cancel every one"}),
+            Tool("clipboard", "Work with what the user copied: summarize, explain, translate, fix the grammar, "
+                 "rewrite it, read it out, or copy new text to the clipboard. Translate, fix and rewrite put "
+                 "the result back on the clipboard, ready to paste.", self.clipboard,
+                 {"action": "summarize, explain, translate, fix, rewrite, read, or copy",
+                  "detail": "for translate: the language; for rewrite: how (e.g. 'more formal', 'shorter'); "
+                            "for explain: the user's question; for copy: the exact text to copy"}, ("detail",)),
             Tool("web_search", "Search the internet. Use for prices, scores, people, releases and any fact "
                  "you're not sure of.", self.web_search,
                  {"query": "what to search for, like you'd type it into Google"}),
@@ -418,6 +447,77 @@ class Hands:
             return f"No waiting reminder matches '{text}'. Nothing was cancelled."
         return "Cancelled: " + "; ".join(cancelled)
 
+    # clipboard -----------------------------------------------------------------
+
+    async def clipboard(self, action: str, detail: str = "") -> str:
+        action, detail = action.lower().strip(), (detail or "").strip()
+        try:
+            if action == "copy":
+                if not detail:
+                    return "Nothing was copied (no text was given). The clipboard wasn't changed."
+                await asyncio.to_thread(clipboard.write_text, detail)
+                return "Copied to the clipboard."
+            if action not in ("read", *CLIPBOARD_TASKS):
+                return "Action must be summarize, explain, translate, fix, rewrite, read or copy."
+            text = (await asyncio.to_thread(clipboard.read_text)).strip()
+            if not text:
+                return await self._clipboard_image(action, detail)
+            if action == "read":
+                more = "\n…(it goes on)" if len(text) > MAX_OUTPUT else ""
+                return f"The clipboard has:\n{text[:MAX_OUTPUT]}{more}"
+            if action in ("summarize", "explain"):
+                return await self._clipboard_read(action, detail, text)
+            return await self._clipboard_rewrite(action, detail, text)
+        except clipboard.ClipboardError as e:
+            return str(e)
+
+    async def _clipboard_image(self, action: str, detail: str) -> str:
+        image = await asyncio.to_thread(clipboard.read_image)
+        if image is None:
+            return "The clipboard is empty."
+        if action not in ("read", "summarize", "explain"):
+            return "The clipboard has an image, not text, so there's nothing to " + action + "."
+        return "The clipboard has an image. " + await self._see(
+            image, detail or "Describe this image. If it has text, read it; if it's an error, explain it.")
+
+    async def _clipboard_read(self, action: str, detail: str, text: str) -> str:
+        """Summarize or explain. Long text is summarized piece by piece, then the pieces together."""
+        cut = len(text) > MAX_SUMMARY
+        task = CLIPBOARD_TASKS[action] + (f" The user asks: {detail}" if detail else "")
+        parts = clipboard.chunks(text[:MAX_SUMMARY], SUMMARY_CHUNK)
+        if len(parts) > 1:
+            notes = [await self._rewrite(p, "Summarize the key points of this part in a few sentences.")
+                     for p in parts]
+            text = "\n\n".join(notes)
+        result = await self._rewrite(text, task)
+        return result + ("\n(The text was very long; this covers the first part of it.)" if cut else "")
+
+    async def _clipboard_rewrite(self, action: str, detail: str, text: str) -> str:
+        """Translate, fix or rewrite, and put the result back on the clipboard."""
+        if action == "rewrite" and not detail:
+            return "Ask the user how to rewrite it (shorter, more formal, friendlier…)."
+        if len(text) > MAX_REWRITE:
+            return (f"The copied text is too long to {action} at once (about {len(text.split())} words). "
+                    "Ask the user to copy a smaller part.")
+        task = CLIPBOARD_TASKS[action].format(detail=detail or "English")
+        result = ""
+        for part in clipboard.chunks(text, REWRITE_CHUNK[action]):
+            done = tidy(await self._rewrite(part, task), part)
+            if not done:
+                return f"I couldn't {action} part of it, so I left the clipboard as it was."
+            # Rejoin the pieces the way they were split: between paragraphs, or mid-paragraph.
+            result += done + ("\n\n" if part.endswith("\n") else " ")
+        result = result.strip()
+        if not result:
+            return f"I couldn't {action} it. The clipboard wasn't changed."
+        if action == "fix" and result == text:
+            return "The copied text already looks correct. The clipboard wasn't changed."
+        await asyncio.to_thread(clipboard.write_text, result)
+        done = {"translate": f"Translated into {detail or 'English'}", "fix": "Fixed the grammar",
+                "rewrite": "Rewrote it"}[action]
+        shown = result if len(result) <= 400 else result[:400] + "…"
+        return f"{done} and put it on the clipboard, ready to paste (the original is replaced). It reads:\n{shown}"
+
     # shell ---------------------------------------------------------------------
 
     async def run_command(self, command: str) -> str:
@@ -428,6 +528,20 @@ class Hands:
         if not safe and self.settings.confirm_risky and not await self.confirm(f"run the command: {command}"):
             return "The user said no, so I didn't run it."
         return await asyncio.to_thread(run, ["bash", "-c", command], 30)
+
+
+def tidy(result: str, original: str) -> str:
+    """Strip what small models wrap around a rewrite: a lead-in line, quotes, a code fence."""
+    lead_in = _LEAD_IN.match(result)
+    if lead_in and lead_in[0].strip().lower() not in original.lower():
+        result = result[lead_in.end():].strip()
+    if result.startswith("```") and not original.lstrip().startswith("```"):
+        result = re.sub(r"^```\w*\n?|\n?```$", "", result).strip()
+    if len(result) > 1 and result[0] == result[-1] and result[0] in "\"'“”" and original[:1] not in "\"'“":
+        result = result[1:-1].strip()
+    if result.endswith("”") and result.startswith("“") and not original.startswith("“"):
+        result = result[1:-1].strip()
+    return result
 
 
 def screenshot() -> bytes | None:

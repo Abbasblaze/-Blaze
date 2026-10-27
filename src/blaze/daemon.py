@@ -105,8 +105,11 @@ class Blaze:
         self.quick_stt: Transcriber | None = None
         self.ears: Ears | None = None
         self.eyes: Eyes | None = None
+        # The lambdas look the brain up when called: it's made after the hands, and replaced on reload.
         self.hands = Hands(self.settings.hands, self.memory, self.confirm, self.look_at_camera,
-                           self.look_at_screen, self.open_camera, self.close_camera)
+                           self.look_at_screen, lambda text, task: self.brain.rewrite(text, task),
+                           lambda image, question: self.brain.see(image, question),
+                           self.open_camera, self.close_camera)
         self.brain = Brain(self.settings, self.hands, self.memory)
 
         self.loop: asyncio.AbstractEventLoop | None = None

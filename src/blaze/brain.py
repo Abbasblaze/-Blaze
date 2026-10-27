@@ -25,9 +25,12 @@ OLLAMA_TIMEOUT = 120  # seconds; a stuck Ollama gives an error instead of freezi
 # Ollama keeps ~1.7 GB of VRAM free in case the vision encoder needs it, which pushes half of a 4B
 # model onto the CPU. The whole model plus an image fits in 4 GB, so put every layer on the GPU.
 ALL_LAYERS = 999
+NUM_CTX = 4096  # tokens the model reads and writes per request (a token is ~4 characters of English)
 # Tools that take a few seconds: say something first, so he isn't silent while they run.
-SLOW_TOOLS = {"web_search", "read_webpage", "news", "weather"}
 CHECKING = ["Let me check.", "One sec, I'll look it up.", "Let me look that up.", "Give me a second to check."]
+WORKING = ["On it.", "Give me a sec.", "Sure, one moment.", "Working on it."]
+WEB_TOOLS = {"web_search", "read_webpage", "news", "weather"}
+SLOW_TOOLS = {**dict.fromkeys(WEB_TOOLS, CHECKING), "clipboard": WORKING}
 
 SYSTEM_PROMPT = """You are {name}, {user}'s AI companion. You live on {user}'s laptop: you see them through the webcam, hear them through the microphone, talk out loud, and control the laptop with tools. Think of yourself as a sharp, trusted friend who is as capable as J.A.R.V.I.S. from Iron Man.
 
@@ -49,6 +52,7 @@ When to use tools:
 - {user} asks you to forget something: call forget with a key word from it (for example "pet store").
 - Finding or opening files and apps, windows, volume, brightness, music, battery: call the matching tool.
 - {user} asks you to remind them of something ("remind me at 5 to…", "in 20 minutes tell me to…"): call set_reminder, passing the time in their own words. Then confirm the time the tool reports. To hear what's set: list_reminders. To drop one: cancel_reminder.
+- {user} wants something done with what they copied ("summarize what I copied", "translate this to Urdu", "fix the grammar in my clipboard", "make it more formal", "what's this I copied?"): call clipboard with the matching action. Translate, fix and rewrite put the result back on the clipboard: tell {user} it's ready to paste, and don't read long text out. Use the copy action only when {user} asks you to copy something.
 - Weather: call weather. News or "what's happening with…": call news.
 - Anything else current or factual you aren't sure of (prices, scores, results, people, releases, "latest" anything): call web_search, then answer from the results in your own words. If the snippets don't answer it, call read_webpage on the best link. Say where it's from when that matters, but never read out web addresses. To show {user} a page, call open with its address.
 - Your own knowledge stops well before today (the date is under "Right now"). For "this year", "latest" or "now", put the current year in the search, and trust the results over what you remember. If the results disagree with each other, say so instead of guessing.
@@ -60,6 +64,10 @@ When to use tools:
 
 What you know about {user}:
 {facts}{now}"""
+
+REWRITE_PROMPT = """You are a careful writing assistant. Do exactly this task: {task}
+
+Reply with only the result, ready to use as it is. No introduction, no comments, no quotes around it. Keep the original's formatting (paragraphs, lists, code) unless the task says otherwise."""
 
 LEARN_PROMPT = """{user} just said: "{text}"
 
@@ -160,22 +168,24 @@ class Brain:
                 raise BrainUnavailable("I had to reload my brain. Say that again?") from e
             raise BrainUnavailable(f"Ollama error: {e.error}") from e
 
-    def _options(self, json_output: bool = False) -> dict:
+    def _options(self, json_output: bool = False, temperature: float | None = None) -> dict:
         # Every call must use the same load options (GPU layers, context), or Ollama reloads the model.
-        options = {"temperature": 0.1 if json_output else self.settings.brain.temperature, "num_ctx": 4096}
+        if temperature is None:
+            temperature = 0.1 if json_output else self.settings.brain.temperature
+        options = {"temperature": temperature, "num_ctx": NUM_CTX}
         if self.gpu_layers is not None:
             options["num_gpu"] = self.gpu_layers
         return options
 
     async def _chat(self, model: str, messages: list, tools: list | None = None,
-                    json_output: bool = False) -> ollama.Message:
+                    json_output: bool = False, temperature: float | None = None) -> ollama.Message:
         with self._ollama_errors(model):
             response = await self.client.chat(
                 model=model,
                 messages=messages,
                 tools=tools,
                 format="json" if json_output else None,
-                options=self._options(json_output),
+                options=self._options(json_output, temperature),
                 think=False,  # "thinking" models are too slow for a voice conversation
                 keep_alive=KEEP_ALIVE,
             )
@@ -237,12 +247,13 @@ class Brain:
                     for sentence in _SENTENCE_END.split(tighten(_TEXT_TOOL_CALL.sub("", held))):
                         emit(sentence)
                     break
-            if not spoken and any(name in SLOW_TOOLS for name, _ in calls):
-                emit(random.choice(CHECKING))
+            fillers = next((SLOW_TOOLS[name] for name, _ in calls if name in SLOW_TOOLS), None)
+            if not spoken and fillers:
+                emit(random.choice(fillers))
             for name, args in calls:
                 self.acted = True
                 for key in ("query", "topic"):
-                    if name in SLOW_TOOLS and isinstance(args.get(key), str):
+                    if name in WEB_TOOLS and isinstance(args.get(key), str):
                         args[key] = this_year(args[key], text)
                 result = await self.hands.call(name, args)
                 messages.append({"role": "tool", "content": result, "tool_name": name})
@@ -311,6 +322,13 @@ class Brain:
         ]
         message = await self._chat(self.settings.brain.model, messages)
         return (message.content or "").strip().strip('"')
+
+    async def rewrite(self, text: str, task: str) -> str:
+        """Do a writing task on some text (summarize, translate, fix…) and return just the result."""
+        messages = [{"role": "system", "content": REWRITE_PROMPT.format(task=task)},
+                    {"role": "user", "content": text}]
+        message = await self._chat(self.settings.brain.model, messages, temperature=0.2)
+        return (message.content or "").strip()
 
     async def see(self, image: bytes, question: str) -> str:
         """Ask the vision model about an image."""
