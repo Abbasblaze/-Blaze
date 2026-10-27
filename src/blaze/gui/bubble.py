@@ -42,13 +42,27 @@ class Bubble(QWidget):
         self.camera_action = self.menu.addAction("Open camera", lambda: client.request(
             "camera", on=not self.camera_on))
         self.menu.addSeparator()
+        self.power_action = self.menu.addAction("Turn off Blaze (free RAM)",
+                                                lambda: client.set_power(not client.connected))
         self.menu.addAction("Close app (Blaze keeps running)", quit_app)
         self.muted = False
         self.camera_on = False
 
         client.event.connect(self._on_event)
-        client.connection_changed.connect(lambda ok: ok or self._set_state("offline"))
+        client.connection_changed.connect(self._on_connection)
+        client.power_changed.connect(lambda _: self._on_connection(client.connected))
+        self._on_connection(client.connected)
         self._set_state("idle" if client.connected else "offline")
+
+    def _on_connection(self, connected: bool) -> None:
+        if not connected:
+            self._set_state("offline")
+        for action in self.menu.actions()[1:5]:  # talk, stop, mute, camera need him running
+            action.setEnabled(connected)
+        self.power_action.setEnabled(not self.client.powering)
+        self.power_action.setText(
+            {"starting": "Starting Blaze…", "stopping": "Turning off Blaze…"}.get(self.client.powering)
+            or ("Turn off Blaze (free RAM)" if connected else "Activate Blaze"))
 
     def _set_state(self, state: str) -> None:
         self.orb.set_state(state)

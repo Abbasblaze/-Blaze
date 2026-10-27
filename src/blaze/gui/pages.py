@@ -76,7 +76,9 @@ class HomePage(QWidget):
         self.talk_btn = button("Talk", "primary", lambda: client.request("talk"))
         self.stop_btn = button("Stop talking", slot=lambda: client.request("stop"))
         self.mute_btn = button("Mute mic", slot=self._toggle_mute)
-        for b in (self.talk_btn, self.stop_btn, self.mute_btn):
+        self.power_btn = button("Turn off", "danger", self._toggle_power)
+        self.power_btn.setToolTip("Stop Blaze and his model to free about 4 GB of RAM")
+        for b in (self.talk_btn, self.stop_btn, self.mute_btn, self.power_btn):
             controls.addWidget(b)
         controls.addStretch()
         layout.addLayout(controls)
@@ -103,6 +105,32 @@ class HomePage(QWidget):
         row.addWidget(self.speak_box)
         row.addWidget(button("Send", "primary", self._send))
         layout.addLayout(row)
+
+    def _toggle_power(self) -> None:
+        self.client.set_power(not self.client.connected)
+
+    def on_power(self, step: str) -> None:
+        """Turning on or off: show it until the connection catches up (or it fails)."""
+        if step in ("starting", "stopping"):
+            self.power_btn.setEnabled(False)
+            self.power_btn.setText("Starting…" if step == "starting" else "Turning off…")
+            self.presence_label.setText("Starting Blaze and his model…" if step == "starting"
+                                        else "Stopping Blaze and his model to free up RAM…")
+        elif step:
+            self.presence_label.setText(f"Couldn't do that: {step}")
+            self._show_power(self.client.connected)
+        elif self.power_btn.text() == "Starting…" and not self.client.connected:
+            # Started; he's still loading. The connection resets the button, or this does if he never comes up.
+            QTimer.singleShot(60_000, lambda: self.client.powering or self._show_power(self.client.connected))
+        else:
+            self._show_power(self.client.connected)
+
+    def _show_power(self, connected: bool) -> None:
+        self.power_btn.setEnabled(True)
+        self.power_btn.setText("Turn off" if connected else "Activate")
+        self.power_btn.setObjectName("danger" if connected else "primary")
+        self.power_btn.style().unpolish(self.power_btn)
+        self.power_btn.style().polish(self.power_btn)
 
     def _toggle_mute(self) -> None:
         self.client.request("mute", muted=not self.muted)
@@ -154,6 +182,8 @@ class HomePage(QWidget):
     def set_connected(self, connected: bool) -> None:
         for w in (self.talk_btn, self.stop_btn, self.mute_btn, self.input):
             w.setEnabled(connected)
+        if not self.client.powering:
+            self._show_power(connected)
         if connected:
             def fill(ok: bool, messages) -> None:
                 self.chat.clear()
@@ -162,7 +192,8 @@ class HomePage(QWidget):
             self.client.request("recent", fill)
         else:
             self._set_state("offline")
-            self.presence_label.setText("Start him from Settings → Startup, or run: systemctl --user start blaze")
+            if self.client.powering != "starting":
+                self.presence_label.setText("Turned off, so his RAM is free. Press Activate to bring him back.")
             self.banner.hide()
 
 

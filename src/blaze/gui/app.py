@@ -53,6 +53,7 @@ class MainWindow(QMainWindow):
 
         client.event.connect(self._on_event)
         client.connection_changed.connect(self._on_connection)
+        client.power_changed.connect(self._on_power)
         self._on_connection(client.connected)
         self._refresh_names()
 
@@ -68,6 +69,15 @@ class MainWindow(QMainWindow):
             self.client.request("options", lambda ok, data: ok and self.settings.fill_options(data))
         else:
             self.statusBar().showMessage("Blaze isn't running")
+
+    def _on_power(self, step: str) -> None:
+        self.home.on_power(step)
+        if step == "stopping":
+            self.statusBar().showMessage("Turning Blaze off…")
+        elif step == "starting":
+            self.statusBar().showMessage("Starting Blaze…")
+        elif step:
+            self.statusBar().showMessage(f"Couldn't turn Blaze on or off: {step}", 10000)
 
     def _on_event(self, msg: dict) -> None:
         self.home.on_event(msg)

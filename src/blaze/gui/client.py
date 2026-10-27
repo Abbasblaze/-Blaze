@@ -3,17 +3,20 @@
 import json
 from collections.abc import Callable
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 from PySide6.QtNetwork import QLocalSocket
 
 from ..paths import SOCKET_PATH
 
 Callback = Callable[[bool, object], None]  # (ok, data or error message)
+# Turning Blaze off stops the model server too: together they hold about 4 GB of RAM.
+SERVICES = ["blaze.service", "blaze-ollama.service"]
 
 
 class DaemonClient(QObject):
     event = Signal(dict)
     connection_changed = Signal(bool)
+    power_changed = Signal(str)  # "starting", "stopping", "" when done, or an error message
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -21,6 +24,7 @@ class DaemonClient(QObject):
         self._buffer = b""
         self._next_id = 1
         self._callbacks: dict[int, Callback] = {}
+        self.powering = ""
 
         self._socket = QLocalSocket(self)
         self._socket.connected.connect(self._on_connected)
@@ -31,6 +35,23 @@ class DaemonClient(QObject):
         self._retry = QTimer(self, interval=2000, timeout=self._connect)
         self._retry.start()
         self._connect()
+
+    def set_power(self, on: bool) -> None:
+        """Start Blaze and his model server, or stop both to free their memory."""
+        if self.powering:
+            return
+        self.powering = "starting" if on else "stopping"
+        self.power_changed.emit(self.powering)
+        process = QProcess(self)
+
+        def finished(code: int, _status) -> None:
+            error = bytes(process.readAllStandardError()).decode().strip()
+            self.powering = ""
+            self.power_changed.emit("" if code == 0 else error or f"systemctl failed (exit {code})")
+            process.deleteLater()
+        process.finished.connect(finished)
+        # Starting Blaze brings the model server up with him (the unit Wants it).
+        process.start("systemctl", ["--user", "start" if on else "stop", *(SERVICES[:1] if on else SERVICES)])
 
     def _connect(self) -> None:
         if self._socket.state() == QLocalSocket.LocalSocketState.UnconnectedState:
