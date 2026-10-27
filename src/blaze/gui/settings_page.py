@@ -73,6 +73,7 @@ class SettingsPage(QWidget):
         self._build_listening()
         self._build_camera()
         self._build_hands()
+        self._build_briefing()
         self._build_startup()
         self.form.addStretch()
 
@@ -204,6 +205,23 @@ class SettingsPage(QWidget):
                           "first by voice or with the Yes/No bar on the Home page. Web search \"free\" needs no "
                           "account; for ollama or brave, paste an API key from ollama.com or brave.com/search/api."))
 
+    def _build_briefing(self) -> None:
+        f = self._group("Daily briefing")
+        self.briefing_enabled = QCheckBox("Brief me the first time I show up each day")
+        self.briefing_place = QLineEdit(placeholderText="e.g. Lahore (empty = guess from my internet)")
+        self.briefing_topic = QLineEdit(placeholderText="tech & AI, AI, tech, top news, business… or any topic")
+        row = QHBoxLayout()
+        row.addWidget(button("Brief me now", slot=lambda: self.client.request(
+            "chat", text="Give me my daily briefing.", speak=True)))
+        row.addStretch()
+        f.addRow("", self.briefing_enabled)
+        f.addRow("Weather for", self.briefing_place)
+        f.addRow("News about", self.briefing_topic)
+        f.addRow("", row)
+        f.addRow("", hint("When you log in, or come back after 45 minutes or more away, he gives you the weather, "
+                          "today's reminders and a few headlines, once a day. A day starts at 4 AM, so late "
+                          "nights count as the day before. You can also ask him: \u201cgive me my briefing\u201d."))
+
     def _build_startup(self) -> None:
         f = self._group("Startup")
         self.autostart = QCheckBox("Start Blaze when I log in")
@@ -263,6 +281,9 @@ class SettingsPage(QWidget):
         self.search_roots.setText(", ".join(s.hands.search_roots))
         set_combo(self.web_engine, s.hands.web_search_engine)
         self.web_key.setText(s.hands.web_search_api_key)
+        self.briefing_enabled.setChecked(s.briefing.enabled)
+        self.briefing_place.setText(s.briefing.place)
+        self.briefing_topic.setText(s.briefing.news_topic)
 
         self.autostart.blockSignals(True)
         self.autostart.setChecked(user_service("is-enabled").stdout.strip() == "enabled")
@@ -318,6 +339,8 @@ class SettingsPage(QWidget):
                       "search_roots": split(self.search_roots.text()) or ["~"],
                       "web_search_engine": self.web_engine.currentText(),
                       "web_search_api_key": self.web_key.text().strip()},
+            "briefing": {"enabled": self.briefing_enabled.isChecked(), "place": self.briefing_place.text().strip(),
+                         "news_topic": self.briefing_topic.text().strip() or "tech & AI"},
         })
 
     def save(self, then=None) -> None:

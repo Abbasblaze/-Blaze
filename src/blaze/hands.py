@@ -165,6 +165,7 @@ class Hands:
         look_screen: Callable[[str], Awaitable[str]],
         rewrite: Callable[[str, str], Awaitable[str]],
         see: Callable[[bytes, str], Awaitable[str]],
+        briefing: Callable[[], Awaitable[str]],
         open_camera: Callable[[], Awaitable[str]],
         close_camera: Callable[[], Awaitable[str]],
     ):
@@ -175,6 +176,7 @@ class Hands:
         self._look_screen = look_screen
         self._rewrite = rewrite
         self._see = see
+        self._briefing = briefing
         self._open_camera = open_camera
         self._close_camera = close_camera
         self.browser_id, self.browser_name = default_browser()
@@ -253,6 +255,8 @@ class Hands:
                  {"query": "what to search for, like you'd type it into Google"}),
             Tool("news", "Latest news headlines about a topic.", self.news,
                  {"topic": "what the news should be about, e.g. Pakistan cricket"}),
+            Tool("daily_briefing", "The user's briefing for today: weather, today's reminders and the top headlines.",
+                 self._briefing),
             Tool("weather", "Current weather and the forecast for the next days.", self.weather,
                  {"place": "city name"}),
             Tool("read_webpage", "Read the text of a web page, e.g. a search result, when its snippet isn't enough.",

@@ -80,6 +80,12 @@ class HandsSettings(BaseModel):
     web_search_api_key: str = ""
 
 
+class BriefingSettings(BaseModel):
+    enabled: bool = True  # brief me the first time I show up each day
+    place: str = ""  # city for the weather; empty = guess from the internet connection
+    news_topic: str = "tech & AI"  # or "top news", "AI", "world", "business"… or any topic
+
+
 class Settings(BaseModel):
     persona: PersonaSettings = PersonaSettings()
     brain: BrainSettings = BrainSettings()
@@ -87,6 +93,7 @@ class Settings(BaseModel):
     listening: ListeningSettings = ListeningSettings()
     camera: CameraSettings = CameraSettings()
     hands: HandsSettings = HandsSettings()
+    briefing: BriefingSettings = BriefingSettings()
 
     @classmethod
     def load(cls) -> "Settings":

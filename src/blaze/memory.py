@@ -133,3 +133,6 @@ class Memory:
 
     def log_event(self, kind: str, detail: str = "") -> None:
         self._exec("INSERT INTO events (ts, kind, detail) VALUES (?, ?, ?)", (time.time(), kind, detail))
+
+    def has_event(self, kind: str, detail: str) -> bool:
+        return bool(self._exec("SELECT 1 FROM events WHERE kind = ? AND detail = ? LIMIT 1", (kind, detail)))

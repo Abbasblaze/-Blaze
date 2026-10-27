@@ -11,9 +11,10 @@ import logging
 import re
 import signal
 import time
+from datetime import datetime
 from pathlib import Path
 
-from . import __version__
+from . import __version__, briefing
 from .brain import Brain, BrainUnavailable
 from .ears import Ears, list_devices
 from .eyes import Eyes
@@ -37,6 +38,7 @@ MAX_HOLD = 2.5  # never wait longer than this after your last words for "more" (
 STILL_TALKING = 4.0  # speech starting this soon after your last words is you carrying on, not someone else
 REPLY_TIMEOUT = 180  # seconds; a reply that takes longer is given up, so Blaze can never freeze
 WAKE_CHECK_SECONDS = 4  # how much of a long utterance gets re-checked for a misheard "Blaze"
+ARRIVAL_GAP = 45 * 60  # coming back after this long away counts as showing up (for the daily briefing)
 
 
 def is_echo(heard: str, said: str) -> bool:
@@ -87,6 +89,7 @@ class Blaze:
         self.asleep = False
         self._last_active = time.monotonic()  # last time you used the laptop, talked to him or were seen
         self._input_idle = False  # no keyboard/mouse input for a while
+        self._briefing_task: asyncio.Task | None = None
         self.recent: collections.deque[dict] = collections.deque(maxlen=50)  # chat shown in the app
         self._said = ""  # what Blaze is saying / said last, to recognize his own echo
         self._echo_until = 0.0  # mic input before this time may contain his voice
@@ -109,7 +112,7 @@ class Blaze:
         self.hands = Hands(self.settings.hands, self.memory, self.confirm, self.look_at_camera,
                            self.look_at_screen, lambda text, task: self.brain.rewrite(text, task),
                            lambda image, question: self.brain.see(image, question),
-                           self.open_camera, self.close_camera)
+                           self.briefing_facts, self.open_camera, self.close_camera)
         self.brain = Brain(self.settings, self.hands, self.memory)
 
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -137,6 +140,7 @@ class Blaze:
         self.spawn(self._reminder_loop())
         self.spawn(self._sleep_loop())
         self.spawn(watch_input(self._on_input_idle))
+        self.spawn(self._arrived_at_startup())
         self.set_state("idle")
         await self.voice.chime()
 
@@ -609,6 +613,8 @@ class Blaze:
         self.publish_status()
         if kind != "arrived" or not cam.greet_after_minutes:
             return
+        if self._briefing_due():
+            return  # the briefing says hello itself
         if not self._owner_present():
             return
         away = data["away_seconds"]
@@ -675,7 +681,10 @@ class Blaze:
 
     def mark_active(self, why: str) -> None:
         """You're here: note it, and if he's asleep, load the model again."""
+        away = time.monotonic() - self._last_active
         self._last_active = time.monotonic()
+        if away >= ARRIVAL_GAP:
+            self._arrived()
         if self.asleep:
             self.asleep = False
             log.info("Waking up (%s): loading the model", why)
@@ -700,6 +709,55 @@ class Blaze:
             self.memory.log_event("sleep", str(int(away)))
             self.set_state(self._resting_state())
             await self.brain.unload()
+
+    # daily briefing -----------------------------------------------------------------
+
+    async def briefing_facts(self) -> str:
+        return await briefing.gather(self.settings.briefing, self.memory)
+
+    def _briefing_due(self) -> bool:
+        return self.settings.briefing.enabled and not self.memory.has_event(
+            "briefing", briefing.day_of(datetime.now()))
+
+    def _arrived(self) -> None:
+        """You've shown up (logged in, or came back after a long while): brief you if it's your first time today."""
+        if self._briefing_due() and not (self._briefing_task and not self._briefing_task.done()):
+            self._briefing_task = self.spawn(self._give_briefing())
+
+    async def _arrived_at_startup(self) -> None:
+        # The idle watcher only speaks up after a minute without input; still quiet by then means you're here.
+        await asyncio.sleep(IDLE_AFTER + 10)
+        if not self._input_idle or self._owner_present():
+            self._arrived()
+
+    async def _give_briefing(self) -> None:
+        await asyncio.sleep(15)  # let you settle in first
+        for _ in range(120):  # wait (up to 10 minutes) for a quiet moment: never talk over a conversation
+            busy = self._turn_lock.locked() or self.voice.speaking or self._pending or self._you_are_talking()
+            if not busy:
+                break
+            await asyncio.sleep(5)
+        else:
+            return
+        if self.muted or not self._briefing_due():
+            return
+        now = datetime.now()
+        facts = await self.briefing_facts()
+        user = self.settings.persona.user_name
+        instruction = briefing.INSTRUCTION.format(user=user, part=briefing.part_of_day(now), facts=facts)
+        async with self._turn_lock:
+            try:
+                line = await self.brain.quick(instruction, self.context(), length="the briefing")
+            except BrainUnavailable as e:
+                log.warning("Skipped the daily briefing: %s", e)
+                return
+            if not line:
+                return
+            self.memory.log_event("briefing", briefing.day_of(now))
+            log.info("Daily briefing")
+            self.brain.add_to_history("(Give me my daily briefing.)", line)
+            await self.speak(line)
+            self.awake_until = time.monotonic() + self.settings.listening.follow_up_seconds
 
     async def _reminder_loop(self) -> None:
         """Give reminders when they're due. They're kept in the database and checked against the

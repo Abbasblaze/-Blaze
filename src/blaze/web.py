@@ -5,13 +5,16 @@ Docker (see the README), which queries Google, Bing, DuckDuckGo and others and i
 reliable than scraping them directly. If SearXNG isn't running, it falls back to scraping Yahoo
 and DuckDuckGo with ddgs, which comes back empty about half the time. With an API key, Ollama's or
 Brave's search API can be used instead. Weather comes from wttr.in and news from ddgs news search,
-both free.
+both free. Headlines come from news feeds (Google News, TechCrunch, The Verge), and where you are
+from ipinfo.io.
 """
 
 import asyncio
 import datetime
+import email.utils
 import logging
 import re
+import xml.etree.ElementTree as ET
 
 import httpx
 import trafilatura
@@ -28,6 +31,22 @@ SCRAPE_BACKENDS = ("yahoo", "duckduckgo")  # the ddgs backends that sometimes an
 NEWS_BACKENDS = ("bing", "yahoo")
 MAX_PAGE_WORDS = 500  # a whole page would overflow the model's context
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+
+
+# Google News sections: their headlines are the big stories, where a search just matches words.
+NEWS_SECTIONS = {"world": "WORLD", "business": "BUSINESS", "technology": "TECHNOLOGY", "tech": "TECHNOLOGY",
+                 "science": "SCIENCE", "sports": "SPORTS", "sport": "SPORTS", "health": "HEALTH",
+                 "entertainment": "ENTERTAINMENT"}
+
+
+# Feeds for AI and tech news: what tech people actually read, instead of whatever a search matches.
+AI_FEEDS = ("https://techcrunch.com/category/artificial-intelligence/feed/",
+            "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml")
+TECH_FEEDS = ("https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-US&gl=US&ceid=US:en",
+              "https://techcrunch.com/feed/")
+NEWS_FEEDS = {"ai": AI_FEEDS, "artificial intelligence": AI_FEEDS, "tech": TECH_FEEDS, "technology": TECH_FEEDS}
+MAX_NEWS_AGE = datetime.timedelta(days=2)
+ATOM = "{http://www.w3.org/2005/Atom}"
 
 
 class SearchFailed(Exception):
@@ -124,6 +143,11 @@ async def search(query: str, settings: HandsSettings) -> str:
 
 
 async def news(topic: str) -> str:
+    feeds = NEWS_FEEDS.get(re.sub(r"\s+news$", "", topic.lower().strip()))
+    if feeds:  # "AI news", "tech news": the tech press, not a word search
+        titles = await feed_headlines(feeds, MAX_RESULTS)
+        if titles:
+            return "\n".join(f"{i}. {t}" for i, t in enumerate(titles, 1))
     results = await _race(lambda b: DDGS(timeout=5).news(topic, max_results=MAX_RESULTS, backend=b) or [],
                           NEWS_BACKENDS)
     if not results:
@@ -169,6 +193,106 @@ async def weather(place: str) -> str:
         lines.append(f"{name}: {desc}, {day['mintempC']} to {day['maxtempC']}°C, "
                      f"up to {rain}% chance of rain.")
     return "\n".join(lines)
+
+
+async def locate() -> tuple[str, str]:
+    """Roughly where the laptop is, from its internet address: (city, two-letter country code)."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get("https://ipinfo.io/json")
+            r.raise_for_status()
+            data = r.json()
+    except (httpx.HTTPError, ValueError):
+        return "", ""
+    return data.get("city", ""), data.get("country", "")
+
+
+async def headlines(topic: str = "", country: str = "", count: int = 3) -> list[str]:
+    """Today's headlines, from Google News: the top stories in your country, or the latest on a topic."""
+    country = country.upper() if re.fullmatch(r"[A-Za-z]{2}", country) else "US"
+    locale = {"hl": f"en-{country}", "gl": country, "ceid": f"{country}:en"}
+    section = NEWS_SECTIONS.get(topic.lower().strip())
+    if section:
+        url, params = f"https://news.google.com/rss/headlines/section/topic/{section}", locale
+    elif topic:
+        url, params = "https://news.google.com/rss/search", {"q": f"{topic} when:1d", **locale}
+    else:
+        url, params = "https://news.google.com/rss", locale
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+        items = ET.fromstring(r.content).findall("./channel/item")
+    except (httpx.HTTPError, ET.ParseError) as e:
+        log.warning("Couldn't get headlines: %s", e)
+        return []
+    titles = []
+    for item in items:
+        title = re.sub(r"[\u200b-\u200f\ufeff]", "", item.findtext("title") or "")  # invisible characters
+        title = title.rsplit(" - ", 1)[0].strip()  # drop " - Al Jazeera"
+        if re.search(r"[~^#@™\[\]{}|]{2,}|[\uff01-\uff5e]", title):  # spam ("~^%#@™[[PPTV Live]]")
+            continue
+        if title and title not in titles:
+            titles.append(title)
+    return titles[:count]
+
+
+def _clean_title(title: str) -> str:
+    title = re.sub(r"[\u200b-\u200f\ufeff]", "", title)  # invisible characters
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def _when(text: str | None) -> datetime.datetime | None:
+    """A feed's date, in either format feeds use (RFC 822 or ISO 8601)."""
+    if not text:
+        return None
+    try:
+        return email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+async def _read_feed(client: httpx.AsyncClient, url: str) -> list[tuple[datetime.datetime, str]]:
+    """(published, title) for each recent story in an RSS or Atom feed."""
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except (httpx.HTTPError, ET.ParseError) as e:
+        log.warning("Couldn't read the feed %s: %s", url, e)
+        return []
+    oldest = datetime.datetime.now(datetime.UTC) - MAX_NEWS_AGE
+    stories = []
+    for item in root.findall("./channel/item") or root.findall(f"{ATOM}entry"):
+        title = _clean_title(item.findtext("title") or item.findtext(f"{ATOM}title") or "")
+        if "news.google.com" in url:
+            title = title.rsplit(" - ", 1)[0]  # Google adds " - The Guardian"
+        when = _when(item.findtext("pubDate") or item.findtext(f"{ATOM}published") or item.findtext(f"{ATOM}updated"))
+        if title and when and when.tzinfo and when >= oldest:
+            stories.append((when, title))
+    return stories
+
+
+def _same_story(a: str, b: str) -> bool:
+    words_a, words_b = set(re.findall(r"\w+", a.lower())), set(re.findall(r"\w+", b.lower()))
+    return len(words_a & words_b) / max(min(len(words_a), len(words_b)), 1) >= 0.6
+
+
+async def feed_headlines(feeds: tuple[str, ...], count: int, skip: list[str] = ()) -> list[str]:
+    """The newest headlines across some feeds, without repeats (or anything in `skip`)."""
+    async with httpx.AsyncClient(timeout=8, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+        stories = sum(await asyncio.gather(*(_read_feed(client, url) for url in feeds)), [])
+    titles: list[str] = []
+    for _, title in sorted(stories, reverse=True):
+        if not any(_same_story(title, t) for t in [*titles, *skip]):
+            titles.append(title)
+        if len(titles) == count:
+            break
+    return titles
 
 
 async def read_page(url: str) -> str:

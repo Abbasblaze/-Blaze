@@ -30,7 +30,7 @@ NUM_CTX = 4096  # tokens the model reads and writes per request (a token is ~4 c
 CHECKING = ["Let me check.", "One sec, I'll look it up.", "Let me look that up.", "Give me a second to check."]
 WORKING = ["On it.", "Give me a sec.", "Sure, one moment.", "Working on it."]
 WEB_TOOLS = {"web_search", "read_webpage", "news", "weather"}
-SLOW_TOOLS = {**dict.fromkeys(WEB_TOOLS, CHECKING), "clipboard": WORKING}
+SLOW_TOOLS = {**dict.fromkeys(WEB_TOOLS, CHECKING), "daily_briefing": CHECKING, "clipboard": WORKING}
 
 SYSTEM_PROMPT = """You are {name}, {user}'s AI companion. You live on {user}'s laptop: you see them through the webcam, hear them through the microphone, talk out loud, and control the laptop with tools. Think of yourself as a sharp, trusted friend who is as capable as J.A.R.V.I.S. from Iron Man.
 
@@ -53,6 +53,7 @@ When to use tools:
 - Finding or opening files and apps, windows, volume, brightness, music, battery: call the matching tool.
 - {user} asks you to remind them of something ("remind me at 5 to…", "in 20 minutes tell me to…"): call set_reminder, passing the time in their own words. Then confirm the time the tool reports. To hear what's set: list_reminders. To drop one: cancel_reminder.
 - {user} wants something done with what they copied ("summarize what I copied", "translate this to Urdu", "fix the grammar in my clipboard", "make it more formal", "what's this I copied?"): call clipboard with the matching action. Translate, fix and rewrite put the result back on the clipboard: tell {user} it's ready to paste, and don't read long text out. Use the copy action only when {user} asks you to copy something.
+- {user} asks for their briefing, a rundown of the day or "what's my day looking like": call daily_briefing, then tell it in about 80 spoken words.
 - Weather: call weather. News or "what's happening with…": call news.
 - Anything else current or factual you aren't sure of (prices, scores, results, people, releases, "latest" anything): call web_search, then answer from the results in your own words. If the snippets don't answer it, call read_webpage on the best link. Say where it's from when that matters, but never read out web addresses. To show {user} a page, call open with its address.
 - Your own knowledge stops well before today (the date is under "Right now"). For "this year", "latest" or "now", put the current year in the search, and trust the results over what you remember. If the results disagree with each other, say so instead of guessing.
@@ -313,12 +314,12 @@ class Brain:
             log.info("Learned: %s", added)
         return added
 
-    async def quick(self, instruction: str, context: str = "") -> str:
+    async def quick(self, instruction: str, context: str = "", length: str = "the one or two sentences") -> str:
         """A one-off line Blaze says on his own (greetings, reminders). No tools, not logged."""
         messages = [
             {"role": "system", "content": self.system_prompt(context)},
             {"role": "user", "content": f"(System note, not from {self.settings.persona.user_name}: {instruction} "
-                                        "Reply with just the one or two sentences you'd say out loud.)"},
+                                        f"Reply with just {length} you'd say out loud.)"},
         ]
         message = await self._chat(self.settings.brain.model, messages)
         return (message.content or "").strip().strip('"')
@@ -360,6 +361,12 @@ class Brain:
         except Exception:
             return []
         return sorted(m.model for m in listing.models)
+
+    def add_to_history(self, prompt: str, reply: str) -> None:
+        """Keep something he said on his own in the conversation, so you can follow up on it."""
+        self.history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": reply}]
+        self.history = self.history[-100:]
+        self.memory.log_message("assistant", reply)
 
     def reset(self) -> None:
         self.history.clear()
