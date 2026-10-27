@@ -26,7 +26,8 @@ CASES = [
     ("Turn the volume down to 30", "set_volume"),
     ("Pause the music", "media"),
     ("How much battery do I have?", "system_status"),
-    ("Remind me in 10 minutes to call mom", "set_timer"),
+    ("Remind me in 10 minutes to call mom", "set_reminder"),
+    ("Remind me at 5:30 pm to send the invoice", "set_reminder"),
     ("Which windows are open?", "list_windows"),
     ("I'm working on a robot project called Blaze this month", "remember"),
     ("How are you doing?", None),
@@ -40,7 +41,7 @@ async def evaluate(model: str) -> None:
 
     async def nothing(*_):
         return ""
-    hands = Hands(settings.hands, memory, nothing, nothing, nothing, lambda *_: None, nothing, nothing)
+    hands = Hands(settings.hands, memory, nothing, nothing, nothing, nothing, nothing)
     brain = Brain(settings, hands, memory)
     client = ollama.AsyncClient()
     await client.chat(model=model, messages=[{"role": "user", "content": "hi"}])  # warm up

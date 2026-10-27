@@ -33,6 +33,13 @@ CREATE TABLE IF NOT EXISTS events (
     kind   TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS reminders (
+    id      INTEGER PRIMARY KEY,
+    due     REAL NOT NULL,
+    message TEXT NOT NULL,
+    created REAL NOT NULL,
+    done    INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -95,6 +102,32 @@ class Memory:
                 if any(m["role"] == "assistant" for m in msgs):
                     f.write(json.dumps({"messages": [{"role": "system", "content": system_prompt}, *msgs]}) + "\n")
         return out
+
+    # reminders ---------------------------------------------------------------
+
+    def add_reminder(self, due: float, message: str) -> int:
+        with self._lock, self._db:
+            return self._db.execute("INSERT INTO reminders (due, message, created) VALUES (?, ?, ?)",
+                                    (due, message.strip(), time.time())).lastrowid
+
+    def reminders(self) -> list[dict]:
+        """Reminders that haven't gone off yet, soonest first."""
+        return [dict(r) for r in self._exec("SELECT id, due, message FROM reminders WHERE done = 0 ORDER BY due")]
+
+    def due_reminders(self, now: float) -> list[dict]:
+        """Reminders whose time has come, marked as done so they go off only once."""
+        rows = [dict(r) for r in self._exec("SELECT id, due, message FROM reminders WHERE done = 0 AND due <= ?"
+                                            " ORDER BY due", (now,))]
+        for r in rows:
+            self._exec("UPDATE reminders SET done = 1 WHERE id = ?", (r["id"],))
+        return rows
+
+    def cancel_reminders(self, text: str) -> list[str]:
+        """Cancel the waiting reminders whose message contains `text` ("" cancels them all)."""
+        rows = self._exec("SELECT id, message FROM reminders WHERE done = 0 AND message LIKE ?", (f"%{text.strip()}%",))
+        for r in rows:
+            self._exec("DELETE FROM reminders WHERE id = ?", (r["id"],))
+        return [r["message"] for r in rows]
 
     # events ------------------------------------------------------------------
 

@@ -101,7 +101,7 @@ class Blaze:
         self.ears: Ears | None = None
         self.eyes: Eyes | None = None
         self.hands = Hands(self.settings.hands, self.memory, self.confirm, self.look_at_camera,
-                           self.look_at_screen, self.remind, self.open_camera, self.close_camera)
+                           self.look_at_screen, self.open_camera, self.close_camera)
         self.brain = Brain(self.settings, self.hands, self.memory)
 
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -126,6 +126,7 @@ class Blaze:
         self._ear_task = self.spawn(self._ear_loop())
         self.spawn(self._tick_loop())
         self.spawn(self._watch_loop())
+        self.spawn(self._reminder_loop())
         self.set_state("idle")
         await self.voice.chime()
 
@@ -646,13 +647,23 @@ class Blaze:
                     f"{self.settings.persona.user_name} has been sitting at the desk for {human_duration(sat)} "
                     "without a break. Suggest a short break — stretch, water, look away from the screen."))
 
-    def remind(self, seconds: float, message: str) -> None:
-        async def fire():
-            await asyncio.sleep(seconds)
-            run(["notify-send", "-a", self.settings.persona.name, "Reminder", message])
-            async with self._turn_lock:
-                await self.speak(f"Hey {self.settings.persona.user_name}, reminder: {message}")
-        self.spawn(fire())
+    async def _reminder_loop(self) -> None:
+        """Give reminders when they're due. They're kept in the database and checked against the
+        clock, so they survive a restart, and ones missed while the laptop was off or asleep are
+        given as soon as he's back."""
+        while True:
+            for reminder in self.memory.due_reminders(time.time()):
+                message, late = reminder["message"], time.time() - reminder["due"]
+                run(["notify-send", "-a", self.settings.persona.name, "-u", "critical", "Reminder", message])
+                if late > 5 * 60:
+                    line = (f"Hey {self.settings.persona.user_name}, I missed this at "
+                            f"{time.strftime('%-I:%M %p', time.localtime(reminder['due']))}: {message}")
+                else:
+                    line = f"Hey {self.settings.persona.user_name}, reminder: {message}"
+                self.memory.log_event("reminder", message)
+                async with self._turn_lock:  # after the current reply, never over it
+                    await self.speak(line)
+            await asyncio.sleep(5)
 
     # commands from the app / CLI ------------------------------------------------
 

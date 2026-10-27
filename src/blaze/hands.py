@@ -18,12 +18,14 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import psutil
 
 from . import web
 from .memory import Memory
+from .reminders import describe, parse_when
 from .settings import HandsSettings
 
 log = logging.getLogger(__name__)
@@ -142,7 +144,6 @@ class Hands:
         confirm: Callable[[str], Awaitable[bool]],
         look_camera: Callable[[str], Awaitable[str]],
         look_screen: Callable[[str], Awaitable[str]],
-        remind: Callable[[float, str], None],
         open_camera: Callable[[], Awaitable[str]],
         close_camera: Callable[[], Awaitable[str]],
     ):
@@ -151,7 +152,6 @@ class Hands:
         self.confirm = confirm
         self._look_camera = look_camera
         self._look_screen = look_screen
-        self._remind = remind
         self._open_camera = open_camera
         self._close_camera = close_camera
         self.browser_id, self.browser_name = default_browser()
@@ -213,9 +213,12 @@ class Hands:
                  self.remember, {"fact": "the fact, as a short sentence"}),
             Tool("forget", "Delete remembered facts that match some text.", self.forget,
                  {"text": "text the fact contains"}),
-            Tool("set_timer", "Remind the user of something after some minutes.", self.set_timer,
-                 {"minutes": "how many minutes from now", "message": "what to remind them"},
-                 types={"minutes": "number"}),
+            Tool("set_reminder", "Remind the user of something at a time, or after a while.", self.set_reminder,
+                 {"when": "when, in the user's own words, e.g. 'at 5:30 pm', 'in 20 minutes', 'tomorrow at 9am'",
+                  "message": "what to remind them of, e.g. 'call mom'"}),
+            Tool("list_reminders", "The reminders that are still waiting to go off.", self.list_reminders),
+            Tool("cancel_reminder", "Cancel waiting reminders.", self.cancel_reminder,
+                 {"text": "a word from the reminder, e.g. 'mom', or 'all' to cancel every one"}),
             Tool("web_search", "Search the internet. Use for prices, scores, people, releases and any fact "
                  "you're not sure of.", self.web_search,
                  {"query": "what to search for, like you'd type it into Google"}),
@@ -396,9 +399,24 @@ class Hands:
         n = self.memory.forget_matching(text)
         return f"Forgot {n} fact(s)." if n else "I didn't have anything like that saved."
 
-    def set_timer(self, minutes: float, message: str) -> str:
-        self._remind(float(minutes) * 60, message)
-        return f"Timer set for {minutes} minutes."
+    def set_reminder(self, when: str, message: str) -> str:
+        due = parse_when(str(when))
+        if due is None:
+            return f"I couldn't work out when '{when}' is, so no reminder was set. Ask the user for a time."
+        self.memory.add_reminder(due.timestamp(), message)
+        return f"Reminder set for {describe(due)}: {message}."
+
+    def list_reminders(self) -> str:
+        waiting = self.memory.reminders()
+        if not waiting:
+            return "No reminders are waiting."
+        return "\n".join(f"{describe(datetime.fromtimestamp(r['due']))}: {r['message']}" for r in waiting)
+
+    def cancel_reminder(self, text: str) -> str:
+        cancelled = self.memory.cancel_reminders("" if text.strip().lower() in ("all", "every", "everything") else text)
+        if not cancelled:
+            return f"No waiting reminder matches '{text}'. Nothing was cancelled."
+        return "Cancelled: " + "; ".join(cancelled)
 
     # shell ---------------------------------------------------------------------
 
