@@ -18,6 +18,7 @@ from .brain import Brain, BrainUnavailable
 from .ears import Ears, list_devices
 from .eyes import Eyes
 from .hands import Hands, run, screenshot
+from .idle import IDLE_AFTER, watch_input
 from .ipc import IpcServer
 from .memory import Memory
 from .models import FACE_DETECTOR, FACE_RECOGNIZER
@@ -82,6 +83,10 @@ class Blaze:
         self._camera_opened = 0.0
         self.last_glance: tuple[float, str] | None = None
         self.last_break_reminder = 0.0
+        # Auto-sleep: with you away, the model is unloaded to free its RAM.
+        self.asleep = False
+        self._last_active = time.monotonic()  # last time you used the laptop, talked to him or were seen
+        self._input_idle = False  # no keyboard/mouse input for a while
         self.recent: collections.deque[dict] = collections.deque(maxlen=50)  # chat shown in the app
         self._said = ""  # what Blaze is saying / said last, to recognize his own echo
         self._echo_until = 0.0  # mic input before this time may contain his voice
@@ -127,6 +132,8 @@ class Blaze:
         self.spawn(self._tick_loop())
         self.spawn(self._watch_loop())
         self.spawn(self._reminder_loop())
+        self.spawn(self._sleep_loop())
+        self.spawn(watch_input(self._on_input_idle))
         self.set_state("idle")
         await self.voice.chime()
 
@@ -213,6 +220,8 @@ class Blaze:
     def _resting_state(self) -> str:
         if self.muted:
             return "muted"
+        if self.asleep:
+            return "asleep"
         return "listening" if time.monotonic() < self.awake_until else "idle"
 
     def status(self) -> dict:
@@ -220,6 +229,7 @@ class Blaze:
             "version": __version__,
             "state": self.state,
             "muted": self.muted,
+            "asleep": self.asleep,
             "model": self.settings.brain.model,
             "voice": self.settings.voice.engine,
             "camera_on": self.camera_on,
@@ -294,6 +304,7 @@ class Blaze:
             self.set_state(self._resting_state())
 
     async def converse(self, text: str, speak: bool = True, post: bool = True) -> str:
+        self.mark_active("you talked to me")
         async with self._turn_lock:
             self.awake_until = float("inf")  # stay in the conversation while thinking and talking
             if post:
@@ -359,6 +370,7 @@ class Blaze:
         """You said something to him: answer once you've finished talking."""
         self.awake_until = float("inf")  # you're talking to him now, so the rest of your sentence counts too
         self._last_heard = time.monotonic()
+        self.mark_active("I heard you")  # start loading the model while you finish talking
         self._post("user", text)
         self._pending.append(text)
         if self._waiter is None or self._waiter.done():
@@ -589,6 +601,8 @@ class Blaze:
         cam = self.settings.camera
         user = self.settings.persona.user_name
         self.memory.log_event(f"presence:{kind}", str(data))
+        if self._owner_present():
+            self.mark_active("I saw you")
         self.publish_status()
         if kind != "arrived" or not cam.greet_after_minutes:
             return
@@ -614,7 +628,7 @@ class Blaze:
                 log.info("Woke up from sleep after %s", human_duration(new_drift - drift))
                 self.memory.log_event("resumed", str(int(new_drift - drift)))
             drift = new_drift
-            if self.state in ("idle", "listening", "muted", "starting"):
+            if self.state in ("idle", "listening", "muted", "starting", "asleep"):
                 self.set_state(self._resting_state())
             self.publish_status()
 
@@ -646,6 +660,43 @@ class Blaze:
                 self.spawn(self.proactive(
                     f"{self.settings.persona.user_name} has been sitting at the desk for {human_duration(sat)} "
                     "without a break. Suggest a short break — stretch, water, look away from the screen."))
+
+    # auto-sleep -------------------------------------------------------------------
+
+    def _on_input_idle(self, idle: bool) -> None:
+        self._input_idle = idle
+        if idle:  # your last input was IDLE_AFTER seconds ago
+            self._last_active = max(self._last_active, time.monotonic() - IDLE_AFTER)
+        else:
+            self.mark_active("you're back on the laptop")
+
+    def mark_active(self, why: str) -> None:
+        """You're here: note it, and if he's asleep, load the model again."""
+        self._last_active = time.monotonic()
+        if self.asleep:
+            self.asleep = False
+            log.info("Waking up (%s): loading the model", why)
+            self.memory.log_event("wake", why)
+            self.set_state(self._resting_state())
+            self.spawn(self.brain.warm_up())
+
+    async def _sleep_loop(self) -> None:
+        """Unload the model once you've been away for a while. Ears and voice stay on, so he
+        still hears "Hey Blaze" and still gives reminders."""
+        while True:
+            await asyncio.sleep(30)
+            if not self._input_idle or self._owner_present() or self._turn_lock.locked() or self.voice.speaking:
+                self._last_active = time.monotonic()
+                continue
+            minutes = self.settings.brain.sleep_after_minutes
+            away = time.monotonic() - self._last_active
+            if self.asleep or not minutes or away < minutes * 60:
+                continue
+            self.asleep = True
+            log.info("You've been away for %s: unloading the model to free its RAM", human_duration(away))
+            self.memory.log_event("sleep", str(int(away)))
+            self.set_state(self._resting_state())
+            await self.brain.unload()
 
     async def _reminder_loop(self) -> None:
         """Give reminders when they're due. They're kept in the database and checked against the

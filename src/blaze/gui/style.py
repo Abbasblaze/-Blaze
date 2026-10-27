@@ -18,6 +18,7 @@ STATE_COLORS = {
     "muted": "#6b625c",
     "starting": "#8a817b",
     "offline": "#4a4440",
+    "asleep": "#6a5a8a",
 }
 
 STATE_LABELS = {
@@ -28,6 +29,7 @@ STATE_LABELS = {
     "muted": "Microphone muted",
     "starting": "Waking up…",
     "offline": "Blaze isn't running",
+    "asleep": "Asleep to save RAM · wakes when you're back",
 }
 
 STYLESHEET = f"""

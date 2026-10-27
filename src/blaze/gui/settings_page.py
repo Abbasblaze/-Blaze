@@ -112,15 +112,19 @@ class SettingsPage(QWidget):
         self.vision_model = combo([], editable=True)
         self.temperature = spin(0, 2, 0.1, 2)
         self.history_turns = spin(0, 50)
+        self.sleep_after = spin(0, 600, 5, suffix=" min")
         self.ollama_host = QLineEdit()
         f.addRow("Chat model", self.model)
         f.addRow("Vision model", self.vision_model)
         f.addRow("Creativity", self.temperature)
         f.addRow("Conversation memory", self.history_turns)
+        f.addRow("Sleep when away", self.sleep_after)
         f.addRow("Ollama address", self.ollama_host)
         f.addRow("", hint("Models come from Ollama. To add one: ollama pull <name>. Creativity: lower is more "
                           "focused, higher is more playful. Conversation memory = how many back-and-forths "
-                          "he keeps in mind."))
+                          "he keeps in mind. Sleep when away: after this long without you using the laptop, "
+                          "talking to him or being seen, he unloads the model to free about 3 GB of RAM, and "
+                          "loads it again when you're back (0 = never)."))
 
     def _build_voice(self) -> None:
         f = self._group("Voice")
@@ -224,6 +228,7 @@ class SettingsPage(QWidget):
         set_combo(self.vision_model, s.brain.vision_model)
         self.temperature.setValue(s.brain.temperature)
         self.history_turns.setValue(s.brain.history_turns)
+        self.sleep_after.setValue(s.brain.sleep_after_minutes)
         self.ollama_host.setText(s.brain.ollama_host)
 
         self.engine.setCurrentText(s.voice.engine)
@@ -291,6 +296,7 @@ class SettingsPage(QWidget):
                         "personality": self.personality.toPlainText().strip()},
             "brain": {"model": self.model.currentText().strip(), "vision_model": self.vision_model.currentText().strip(),
                       "temperature": self.temperature.value(), "history_turns": int(self.history_turns.value()),
+                      "sleep_after_minutes": self.sleep_after.value(),
                       "ollama_host": self.ollama_host.text().strip()},
             "voice": {"engine": self.engine.currentText(), "kokoro_voice": self.kokoro_voice.currentText(),
                       "speed": self.speed.value(), "volume": self.volume.value(),

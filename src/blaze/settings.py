@@ -32,6 +32,8 @@ class BrainSettings(BaseModel):
     vision_model: str = "qwen3.5:4b"
     temperature: float = Field(0.7, ge=0.0, le=2.0)
     history_turns: int = Field(10, ge=0, le=50)
+    # Unload the model to free its RAM once you've been away this long. 0 = keep it loaded.
+    sleep_after_minutes: float = Field(30.0, ge=0.0)
 
 
 class VoiceSettings(BaseModel):

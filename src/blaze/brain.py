@@ -326,6 +326,16 @@ class Brain:
         except BrainUnavailable as e:
             log.warning("Warm-up failed: %s", e)
 
+    async def unload(self) -> None:
+        """Take the models out of memory (RAM and VRAM). The next request loads them again."""
+        b = self.settings.brain
+        for model in dict.fromkeys((b.model, b.vision_model)):
+            try:
+                with self._ollama_errors(model):
+                    await self.client.generate(model=model, keep_alive=0)
+            except BrainUnavailable as e:
+                log.warning("Couldn't unload %s: %s", model, e)
+
     async def installed_models(self) -> list[str]:
         try:
             listing = await self.client.list()
