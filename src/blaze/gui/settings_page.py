@@ -39,6 +39,7 @@ def spin(lo: float, hi: float, step: float = 1, decimals: int = 0, suffix: str =
     s.setRange(lo, hi)
     s.setSingleStep(step)
     s.setSuffix(suffix)
+    s.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)  # type or scroll; the tiny arrows looked broken
     return s
 
 

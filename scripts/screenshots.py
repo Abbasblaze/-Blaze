@@ -77,10 +77,12 @@ class DemoClient(QObject):
     """Stands in for the daemon connection, answering with demo data."""
     event = Signal(dict)
     connection_changed = Signal(bool)
+    power_changed = Signal(str)
 
     def __init__(self):
         super().__init__()
         self.connected = True
+        self.powering = False
         self.frame = demo_camera_frame()
 
     def request(self, cmd: str, callback=None, **args) -> None:
